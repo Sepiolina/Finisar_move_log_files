@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "archiver_core",
+    "ui",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

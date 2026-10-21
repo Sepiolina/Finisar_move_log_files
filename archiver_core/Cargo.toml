@@ -1,0 +1,23 @@
+[package]
+name = "archiver_core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tar = "0.4"
+zstd = "0.13"
+sha2 = "0.10"
+thiserror = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+aho-corasick = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "=0.10.3"
+
+[dev-dependencies]
+tempfile = "=3.13.0"
