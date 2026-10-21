@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log Archiver</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">LA</span><span class="label">Log Archiver</span></div>
+    <nav>
+      <button class="nav-item active" data-tab="archive" title="Archive">
+        <svg viewBox="0 0 24 24"><path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/></svg><span class="label">Archive</span>
+      </button>
+      <button class="nav-item" data-tab="extract" title="Extract">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 17v3h16v-3"/></svg><span class="label">Extract</span>
+      </button>
+      <button class="nav-item" data-tab="viewer" title="Viewer">
+        <svg viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="label">Viewer</span>
+      </button>
+      <button class="nav-item" data-tab="settings" title="Settings">
+        <svg viewBox="0 0 24 24"><path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M21 18h-1"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="label">Settings</span>
+      </button>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content">
+      <div id="notice" class="banner" hidden></div>
+
+      <!-- ===== Archive ===== -->
+      <section class="tab" id="tab-archive">
+        <h1>Archive logs</h1>
+        <div class="card grid">
+          <div class="field"><label>Source folder</label>
+            <div class="pick"><code data-show="source_dir"></code><button class="ghost" data-pick="source_dir">Browse</button></div></div>
+          <div class="field"><label>Output folder</label>
+            <div class="pick"><code data-show="output_dir"></code><button class="ghost" data-pick="output_dir">Browse</button></div></div>
+          <div class="field"><label for="subfolders">Subfolders <small>comma-separated</small></label>
+            <input id="subfolders" value="BURNIN, ESS, JTAG, STM, Xray"></div>
+          <div class="field"><label for="extensions">Extensions <small>comma-separated, no dots</small></label>
+            <input id="extensions" placeholder="txt, log, csv"></div>
+          <label class="check wide"><input type="checkbox" id="dryRun"> Dry run (preview only, no files moved)</label>
+          <details class="wide" id="adv">
+            <summary>Advanced: override scan date range</summary>
+            <label class="check"><input type="checkbox" id="useRange"> Use custom range</label>
+            <div class="grid">
+              <div class="field"><label for="dateFrom">From <small>optional</small></label><input type="date" id="dateFrom"></div>
+              <div class="field"><label for="dateTo">To <small>required</small></label><input type="date" id="dateTo"></div>
+            </div>
+          </details>
+          <div class="row wide">
+            <button class="primary act" id="startBtn" data-do="archive">Start archive</button>
+            <span class="chip" id="lastScan"></span>
+          </div>
+        </div>
+        <div class="card flow" id="flow-archive"><h3>Execution flow</h3><div class="steps empty">Nothing has run yet.</div></div>
+        <div id="archiveResult"></div>
+      </section>
+
+      <!-- ===== Extract ===== -->
+      <section class="tab" id="tab-extract" hidden>
+        <h1>Extract files</h1>
+        <div class="card">
+          <div class="field"><label for="query">Barcode or filename part</label>
+            <div class="row"><input id="query" placeholder="e.g. A1B2C3 or report_2024">
+              <button class="primary act" id="searchBtn" data-do="search">Search</button></div></div>
+          <div class="field"><label>Destination folder</label>
+            <div class="row"><div class="pick grow"><code data-show="destExtract"></code><button class="ghost" data-pick="destExtract">Browse</button></div>
+              <button class="act" id="extractBtn" data-do="extract">Extract all matches</button></div></div>
+        </div>
+        <div class="card flow" id="flow-extract"><h3>Execution flow</h3><div class="steps empty">Nothing has run yet.</div></div>
+        <div id="extractResult"></div>
+      </section>
+
+      <!-- ===== Viewer ===== -->
+      <section class="tab" id="tab-viewer" hidden>
+        <h1>Archive viewer</h1>
+        <div class="card">
+          <div class="field"><label>Archive (.mochi)</label>
+            <div class="row"><div class="pick grow"><code data-show="volume"></code><button class="ghost" data-pick="volume" data-kind="mochi">Browse</button></div>
+              <button class="primary act" id="loadBtn" data-do="load">Load</button></div></div>
+          <div class="field"><label>Destination folder <small>for extraction</small></label>
+            <div class="pick"><code data-show="destViewer"></code><button class="ghost" data-pick="destViewer">Browse</button></div></div>
+        </div>
+        <div class="card flow" id="flow-viewer"><h3>Execution flow</h3><div class="steps empty">Nothing has run yet.</div></div>
+        <div class="card">
+          <div class="row">
+            <input id="filter" class="grow" placeholder="Filter entries...">
+            <button class="act" id="previewBtn" data-do="preview">Preview</button>
+            <button class="act" id="extractFileBtn" data-do="extractFile">Extract file</button>
+            <button class="act" id="extractAllBtn" data-do="extractAll">Extract all</button>
+          </div>
+          <div class="entries" id="entries"><p class="hint">Load an archive to list its contents.</p></div>
+          <div class="hint" id="entryCount"></div>
+        </div>
+        <div class="card" id="previewCard" hidden>
+          <h3>Preview <small id="previewName"></small></h3>
+          <pre id="preview"></pre>
+          <div class="hint" id="truncNote" hidden>Preview truncated at 512 KB.</div>
+        </div>
+      </section>
+
+      <!-- ===== Settings ===== -->
+      <section class="tab" id="tab-settings" hidden>
+        <h1>Settings</h1>
+        <div class="card grid">
+          <h3 class="wide">SQL Server connection <span class="badge" id="dbBadge">Not saved</span></h3>
+          <div class="field"><label for="db_server">Server</label><input id="db_server"></div>
+          <div class="field"><label for="db_port">Port</label><input id="db_port" type="number" min="1" max="65535"></div>
+          <div class="field"><label for="db_database">Database</label><input id="db_database"></div>
+          <div class="field"><label for="db_username">Username</label><input id="db_username" autocomplete="off"></div>
+          <div class="field wide"><label for="db_password">Password</label>
+            <div class="row"><input id="db_password" type="password" class="grow" autocomplete="off">
+              <button class="ghost" data-do="togglePw">Show</button></div></div>
+          <label class="check"><input type="checkbox" id="db_encrypt"> Encrypt connection</label>
+          <label class="check"><input type="checkbox" id="db_trust_server_certificate"> Trust server certificate</label>
+          <div class="field"><label for="db_request_timeout">Timeout <small>ms</small></label><input id="db_request_timeout" type="number" min="0"></div>
+          <div class="field"><label for="db_retry_attempts">Retries</label><input id="db_retry_attempts" type="number" min="0"></div>
+          <div class="field"><label for="db_retry_base_delay">Backoff <small>ms</small></label><input id="db_retry_base_delay" type="number" min="0"></div>
+          <div class="row wide">
+            <button class="primary" data-do="saveDb">Save connection</button>
+            <button class="ghost" data-do="clearDb">Clear</button>
+          </div>
+        </div>
+        <div class="card grid">
+          <h3 class="wide">Paths</h3>
+          <div class="field"><label for="staging_dir">Staging folder <small>optional</small></label><input id="staging_dir" placeholder="&lt;output&gt;/.staging"></div>
+          <div class="field"><label for="db_path">Index DB path <small>optional</small></label>
+            <div class="row"><input id="db_path" class="grow" placeholder="log_archiver_index.sqlite"><button class="ghost" data-pick="db_path" data-kind="sqlite">Browse</button></div></div>
+        </div>
+        <div class="card grid">
+          <h3 class="wide">Statistics email</h3>
+          <label class="check wide"><input type="checkbox" id="email_stats_enabled"> Send statistics email after each archive run</label>
+          <div class="field"><label for="email_api_base_url">Relay URL</label><input id="email_api_base_url" placeholder="http://10.0.0.5:8080"></div>
+          <div class="field"><label for="email_recipient">Recipient</label><input id="email_recipient" type="email" placeholder="name@example.com"></div>
+          <div class="row wide"><button class="primary" data-do="saveSettings">Save settings</button></div>
+        </div>
+      </section>
+    </div>
+
+    <details class="log" open>
+      <summary>Activity log</summary>
+      <div id="log" class="mono"></div>
+    </details>
+  </main>
+
+  <div id="toasts"></div>
+</body>
+</html>

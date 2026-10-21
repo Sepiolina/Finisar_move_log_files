@@ -1,14 +1,6 @@
-//! Phase 6 — persisted UI settings.
+//! Persisted UI settings (paths, extension filter, email options).
 //!
-//! Per spec: "Persist on close: last source/output paths, extension
-//! filter, last-successful-scan date." Stored as a
-//! flat JSON file via `directories-next` (already pulled in transitively
-//! by `eframe`'s persistence feature, so no new dependency) rather than
-//! `eframe`'s own `App::save` mechanism — that ties persistence to
-//! `eframe`'s storage backend, which is convenient but harder to inspect
-//! or hand-edit if something goes wrong in the field. A plain JSON file
-//! next to the DB is easier to reason about for a tool an operator might
-//! need to debug by hand.
+//! Stored as a plain, hand-editable JSON file in the user's config dir.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
