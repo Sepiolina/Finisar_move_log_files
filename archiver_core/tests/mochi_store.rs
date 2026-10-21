@@ -324,3 +324,36 @@ fn mochi_errors_carry_their_stable_code() {
         other => panic!("unexpected {other}"),
     }
 }
+
+#[test]
+fn identical_file_already_in_head_is_skipped_but_still_reported_and_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("2024-07.mochi");
+    let store = stage(
+        &dir.path().join("s"),
+        &[("BURNIN/a_BC001.txt", b"same bytes".to_vec()), ("ESS/b_BC001.txt", b"other".to_vec())],
+    );
+    let first = mochi_store::store_volume(&archive, &store).unwrap();
+    let len_before = fs::metadata(&archive).unwrap().len();
+
+    // Crash after commit, before cleanup: the resumed run re-stores the same files.
+    let again = mochi_store::store_volume(&archive, &store).unwrap();
+    assert!(again.commit_seqs.is_empty(), "no new commit for identical content");
+    assert_eq!(again.head_seq, first.head_seq);
+    assert_eq!(again.head_commit_id, first.head_commit_id);
+    assert_eq!(fs::metadata(&archive).unwrap().len(), len_before, "archive not modified");
+    assert_eq!(again.written_entries.len(), 2, "entries are still reported for indexing");
+    for e in &again.written_entries {
+        let orig = first.written_entries.iter().find(|o| o.relative_path == e.relative_path).unwrap();
+        assert_eq!(e.content_hash, orig.content_hash);
+    }
+    mochi_store::verify_volume(&archive, &store).unwrap();
+
+    // A changed file is written (new version); the unchanged one is still skipped.
+    fs::write(&store[0].staged_path, b"changed bytes").unwrap();
+    let third = mochi_store::store_volume(&archive, &store).unwrap();
+    assert_eq!(third.commit_seqs.len(), 1);
+    assert_eq!(third.written_entries.len(), 2);
+    mochi_store::verify_volume(&archive, &store).unwrap();
+    assert_eq!(reader::extract_entry_to_bytes(&archive, "BURNIN/a_BC001.txt").unwrap(), b"changed bytes");
+}

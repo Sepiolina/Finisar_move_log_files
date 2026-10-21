@@ -248,3 +248,80 @@ fn a_failed_verification_keeps_staging_and_the_session_open() {
     assert!(staging.join("manifest.jsonl").exists());
     assert_eq!(fs::read(&june_path).unwrap(), b"this is not a mochi archive at all", "garbage file is not modified");
 }
+
+#[test]
+fn cleanup_never_deletes_unlisted_files_left_in_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, output, staging) = (dir.path().join("source"), dir.path().join("output"), dir.path().join("staging"));
+    make_source_tree(&source);
+    let mut conn = open_and_migrate(dir.path().join("index.sqlite")).unwrap();
+    let cfg = config(source.clone(), output.clone(), staging.clone());
+
+    let sid = repo::start_session(&conn, "2024-08-01T00:00:00Z", "2024-06-01", "2024-07-29").unwrap();
+    stage_like_run_session(&cfg, sid);
+    // A file that was renamed into staging by a crashed run but never made it into the manifest.
+    let orphan = staging.join("JTAG/unit_BC002_orphan.txt");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"renamed but unlisted").unwrap();
+
+    run(&mut conn, &cfg, "2024-08-02T00:00:00Z");
+
+    assert_eq!(fs::read(&orphan).unwrap(), b"renamed but unlisted", "unlisted file must survive");
+    assert!(!staging.join("manifest.jsonl").exists());
+    assert!(!staging.join("BURNIN/unit_BC001_log.txt").exists(), "listed, verified files are removed");
+    assert!(!staging.join("BURNIN").exists(), "now-empty directories are pruned");
+    // Counted as an error on the resumed session.
+    let errs: i64 = conn.query_row("SELECT total_errors FROM scan_session WHERE id = ?1", [sid], |r| r.get(0)).unwrap();
+    assert_eq!(errs, 1);
+    // The listed files were archived.
+    assert_eq!(repo::find_entries_by_barcode(&conn, "BC001").unwrap().len(), 2);
+}
+
+#[test]
+fn resume_with_a_listed_file_that_was_never_renamed_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, output, staging) = (dir.path().join("source"), dir.path().join("output"), dir.path().join("staging"));
+    make_source_tree(&source);
+    let mut conn = open_and_migrate(dir.path().join("index.sqlite")).unwrap();
+    let cfg = config(source.clone(), output.clone(), staging.clone());
+
+    // Manifest line written (flushed) before the rename, then the crash: file still in source.
+    let sid = repo::start_session(&conn, "t", "2024-06-01", "2024-07-29").unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    let mut w = StagingManifestWriter::create(&staging, sid).unwrap();
+    w.record(StagedManifestEntry {
+        relative_path: "BURNIN/unit_BC001_log.txt".into(),
+        source_subfolder: "BURNIN".into(),
+        barcode: "BC001".into(),
+        original_size: 21,
+        volume_name: "2024-06".into(),
+    })
+    .unwrap();
+    w.finish().unwrap();
+
+    run(&mut conn, &cfg, "2024-08-02T00:00:00Z");
+    // The never-renamed file was neither lost nor deleted by the cleanup; the
+    // fresh scan in the same run picked it up and archived it.
+    assert_eq!(repo::find_entries_by_barcode(&conn, "BC001").unwrap().len(), 2);
+    assert!(!source.join("BURNIN/unit_BC001_log.txt").exists());
+}
+
+#[test]
+fn invalid_subfolders_are_rejected_at_session_start() {
+    for bad in ["", ".", "..", "../x", "a/b", "a\\b", "C:", "C:evil", "/abs", " sp "] {
+        assert!(archiver_core::session::validate_subfolder(bad).is_err(), "{bad:?} must be rejected");
+    }
+    for ok in ["BURNIN", "Xray", "my folder", "a.b"] {
+        archiver_core::session::validate_subfolder(ok).unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (source, output, staging) = (dir.path().join("source"), dir.path().join("output"), dir.path().join("staging"));
+    make_source_tree(&source);
+    let mut conn = open_and_migrate(dir.path().join("index.sqlite")).unwrap();
+    let mut cfg = config(source.clone(), output, staging);
+    cfg.subfolders = vec!["BURNIN".into(), "../BURNIN".into()];
+    let err = run_session(&mut conn, &cfg, candidates(), "a", "b", "t", None::<&NoProgress>).unwrap_err();
+    assert!(matches!(err, archiver_core::ArchiveError::Config(_)), "{err}");
+    assert!(source.join("BURNIN/unit_BC001_log.txt").exists(), "nothing was touched");
+}

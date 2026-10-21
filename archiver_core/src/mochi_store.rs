@@ -31,12 +31,13 @@
 
 use crate::error::{ArchiveError, Result};
 use mochi_core::catalog::namespace::{EntryKind, Snapshot};
+use mochi_core::catalog::Catalog;
 use mochi_core::catalog::path::ArchivePath;
 use mochi_core::job::{CancellationToken, JobContext, NullProgress};
 use mochi_core::manifest::{Attributes, Mtime};
 use mochi_core::object::OsIds;
 use mochi_core::publish::{
-    open_head, ArchiveWriter, ReadOptions, TailRepair, Transaction, WriterOptions,
+    open_head, ArchiveWriter, PublishDurability, ReadOptions, TailRepair, Transaction, WriterOptions,
 };
 use mochi_core::status::{Status, VerificationLevel};
 use mochi_core::storage::os::{OsDir, OsReadStorage};
@@ -47,11 +48,11 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Upper bound on the file bytes held in memory for one commit (256 MiB).
+/// Upper bound on the file bytes held in memory for one commit (64 MiB).
 /// MOCHI buffers a commit's content, so a month with more data than this is
 /// written as several commits. A file bigger than the budget is committed
 /// alone (it must fit in memory by itself).
-pub const COMMIT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+pub const COMMIT_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// File extension of the monthly archives.
 pub const ARCHIVE_EXTENSION: &str = "mochi";
@@ -91,6 +92,10 @@ pub struct FinishedVolume {
     pub commit_seqs: Vec<u64>,
     /// `true` if this call created the archive.
     pub created: bool,
+    /// Set when a commit was `LOCAL_COMMITTED` but its directory entry is not
+    /// confirmed durable (always the case for a new archive on Windows). This
+    /// is a degraded status, not an error.
+    pub degraded_durability: Option<String>,
 }
 
 /// `<output_dir>/<YYYY>/<volume_name>.mochi` for a `YYYY-MM` volume name.
@@ -132,6 +137,8 @@ fn mtime_of(path: &Path) -> Option<Mtime> {
 }
 
 struct PendingEntry {
+    /// Already in the head with an identical hash: not written again.
+    skipped: bool,
     relative_path: String,
     size: u64,
     content_hash: String,
@@ -165,7 +172,8 @@ impl<'a> Batcher<'a> {
     /// always takes at least one file). `head` is the writer's current
     /// namespace, or `None` while the archive is not created yet. Staged
     /// files that vanished are skipped, as before.
-    fn next_batch(&mut self, head: Option<&Snapshot>) -> Result<Option<Batch>> {
+    fn next_batch(&mut self, head: Option<(&Catalog, &Snapshot)>) -> Result<Option<Batch>> {
+        let head_snapshot = head.map(|(_, s)| s);
         let mut tx = Transaction::new();
         let mut entries = Vec::new();
         let mut used: u64 = 0;
@@ -183,18 +191,47 @@ impl<'a> Batcher<'a> {
                 }
                 Err(e) => return Err(ArchiveError::io(&file.staged_path, e)),
             };
-            if !entries.is_empty() && used.saturating_add(size_on_disk) > self.budget {
+            let path = archive_path_of(&file.relative_path)?;
+
+            // Resume idempotency: identical bytes already in the head are not
+            // written again (no duplicate version, nothing held in memory).
+            if let Some((cat, snap)) = head {
+                if let Some(entry) = snap.get(&path) {
+                    if entry.kind == EntryKind::File {
+                        let stored = cat
+                            .file_version(&entry.version)
+                            .map_err(|e| ArchiveError::from_mochi(&file.staged_path, e))?
+                            .and_then(|(v, _)| v.content_hash)
+                            .map(|h| h.to_hex());
+                        if let Some(stored) = stored {
+                            let hash = hash_file(&file.staged_path)?;
+                            if stored == hash {
+                                entries.push(PendingEntry {
+                                    skipped: true,
+                                    relative_path: file.relative_path.clone(),
+                                    size: size_on_disk,
+                                    content_hash: hash,
+                                });
+                                self.next += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let puts = entries.iter().filter(|e| !e.skipped).count();
+            if puts > 0 && used.saturating_add(size_on_disk) > self.budget {
                 break;
             }
             let content =
                 fs::read(&file.staged_path).map_err(|e| ArchiveError::io(&file.staged_path, e))?;
-            let path = archive_path_of(&file.relative_path)?;
 
             // Explicit directory entries for every ancestor not yet present.
             let mut missing: Vec<ArchivePath> = Vec::new();
             let mut cur = path.parent();
             while let Some(dir) = cur {
-                let in_head = head.is_some_and(|h| h.get(&dir).is_some());
+                let in_head = head_snapshot.is_some_and(|h| h.get(&dir).is_some());
                 if in_head || self.dirs_done.contains(&dir) {
                     break;
                 }
@@ -218,6 +255,7 @@ impl<'a> Batcher<'a> {
                 },
             );
             entries.push(PendingEntry {
+                skipped: false,
                 relative_path: file.relative_path.clone(),
                 size,
                 content_hash: hash,
@@ -274,6 +312,12 @@ pub fn store_volume_with_budget(
     let mut written: Vec<StoredEntry> = Vec::new();
     let mut commit_seqs: Vec<u64> = Vec::new();
     let mut created = false;
+    let mut degraded: Option<String> = None;
+    let note = |d: &PublishDurability, degraded: &mut Option<String>| {
+        if let PublishDurability::DirectoryUnconfirmed(why) = d {
+            degraded.get_or_insert_with(|| why.clone());
+        }
+    };
 
     let mut record = |batch_entries: Vec<PendingEntry>, seq: u64| {
         for e in batch_entries {
@@ -284,8 +328,8 @@ pub fn store_volume_with_budget(
                 commit_seq: seq,
             });
         }
-        commit_seqs.push(seq);
     };
+    let mut record_commit = |seq: u64| commit_seqs.push(seq);
 
     // Open (or create) the writer, committing the first batch on the way.
     let mut writer = if archive_path.exists() {
@@ -303,6 +347,7 @@ pub fn store_volume_with_budget(
                     written_entries: Vec::new(),
                     commit_seqs: Vec::new(),
                     created: false,
+                    degraded_durability: None,
                 });
             }
             Some(first) => {
@@ -310,7 +355,9 @@ pub fn store_volume_with_budget(
                 match ArchiveWriter::create_in(&mut dir, name, Box::new(OsIds), opts(), tx, &ctx) {
                     Ok((w, outcome)) => {
                         created = true;
+                        note(&outcome.durability, &mut degraded);
                         record(entries, outcome.seq);
+                        record_commit(outcome.seq);
                         Some(w)
                     }
                     // Lost a race with another creator: the archive exists now.
@@ -334,13 +381,24 @@ pub fn store_volume_with_budget(
 
     loop {
         let head = writer.catalog().replay(None).map_err(map)?;
-        let Some(batch) = batcher.next_batch(Some(&head))? else {
+        let Some(batch) = batcher.next_batch(Some((writer.catalog(), &head)))? else {
             break;
         };
         drop(head);
         let Batch { tx, entries } = batch;
+        if tx.is_empty() {
+            // Everything in this batch is already committed with identical
+            // bytes; no new commit. Index it at the current head.
+            let seq = writer
+                .head_seq()
+                .ok_or_else(|| ArchiveError::Config("archive has no head".into()))?;
+            record(entries, seq);
+            continue;
+        }
         let outcome = writer.commit(tx, &ctx).map_err(map)?;
+        note(&outcome.durability, &mut degraded);
         record(entries, outcome.seq);
+        record_commit(outcome.seq);
     }
 
     let head_seq = writer
@@ -364,6 +422,7 @@ pub fn store_volume_with_budget(
         written_entries: written,
         commit_seqs,
         created,
+        degraded_durability: degraded,
     })
 }
 
@@ -460,7 +519,7 @@ pub fn verify_volume(archive_path: &Path, files: &[StoreFile]) -> Result<()> {
         .filter(|(_, s)| **s == Status::Fail)
         .map(|(d, _)| format!("{d:?}"))
         .collect();
-    if report.operational_error || !failed.is_empty() {
+    if report.operational_error || report.exit_code == 1 || !failed.is_empty() {
         let findings: Vec<String> = report
             .findings
             .iter()

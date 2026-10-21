@@ -8,7 +8,7 @@ monthly [MOCHI](https://github.com/immerh8/MOCHI) archives
 file's archive path, content hash and commit in a local SQLite
 database for fast later retrieval.
 
-- **60 automated tests** in `archiver_core` (`src/` inline tests +
+- **64 automated tests** in `archiver_core` (`src/` inline tests +
   `tests/*.rs` integration tests), plus 2 in the `ui` crate.
 - Crash-safe by design: a process kill at any point during a run
   leaves either fully-committed data or fully-recoverable staged
@@ -38,7 +38,7 @@ flowchart TD
     K --> L[Append manifest.jsonl entry<br/>after each successful rename]
     L --> M[Group staged files by<br/>target volume  YYYY-MM]
     M --> N[For each volume: create or append<br/>YYYY-MM.mochi, TailRepair::Refuse]
-    N --> O[Commit files in byte-bounded batches<br/>256 MiB per commit, then close writer]
+    N --> O[Commit files in byte-bounded batches<br/>64 MiB per commit, then close writer]
     O --> P[Reopen archive read-only:<br/>head hash == BLAKE3 of staged file<br/>+ verified read-back + Content verify]
     P --> R{Every entry present<br/>and hashes equal?}
     R -- no --> S[Abort — leave staging intact<br/>for next run to resume]
@@ -127,9 +127,15 @@ changed:
    compression-level setting any more).
 2. **Bounded commits.** MOCHI holds a commit's content in memory, so the
    month's staged files are split into several commits whose file bytes
-   stay within `COMMIT_BYTE_BUDGET` (**256 MiB**). A file larger than the
+   stay within `COMMIT_BYTE_BUDGET` (**64 MiB**). A file larger than the
    budget gets a commit of its own. Each commit is one
    `LOCAL_COMMITTED` snapshot; small months are a single commit.
+   **Peak memory:** MOCHI keeps a commit's file bytes in memory while it
+   encodes and writes them, so expect roughly the budget (64 MiB) times a
+   small factor for MOCHI's working copies (chunk buffers, encoded frames),
+   i.e. a few hundred MiB at most for normal files. A single file larger
+   than the budget is committed alone and needs that whole file (times the
+   same factor) in memory, so the largest staged file bounds peak RAM.
 3. The writer is closed with `close()` to release the archive's
    single-writer lock; the head `commit_id` and `seq` are returned.
 
@@ -143,10 +149,22 @@ never truncated automatically**: the run aborts, staging is kept, and a
 person has to run `mochi verify` and then `mochi append --truncate-tail`
 (which quarantines the tail first).
 
-Idempotency: re-storing a path that already exists just writes a new
-version of it (same bytes, so chunk dedup makes it cheap) — this is what
-makes resuming a batch that was committed but not yet recorded safe: the
-namespace still holds each file once.
+Idempotency: before a file is put, the head is checked; if the path is
+already there with an identical BLAKE3 hash the file is **not written
+again** (no duplicate version, nothing read into memory). It is still
+returned in `written_entries` (so it is verified and indexed; its
+`commit_seq` is the head sequence at that moment, i.e. "added at or before
+this commit"). A batch made only of such files makes no new commit. This
+is what makes resuming a batch that was committed but not yet recorded
+free of duplicates. A changed file with the same path is written as a new
+version.
+
+**Durability:** if a commit reports `DirectoryUnconfirmed` (always the
+case for a new archive on Windows), `FinishedVolume.degraded_durability`
+is set and the session logs a `DEGRADED (not an error)` line and lists it
+in `SessionResult.durability_notes`. The data is committed
+(`LOCAL_COMMITTED`) but the directory entry is not confirmed durable; it is
+never shown as success-styled "safe".
 
 ### Verification (replaces "decompress a chunk and count")
 
@@ -161,7 +179,8 @@ entry, requires:
    hash to the same value (end-to-end verified read);
 
 and finally runs `verify::verify` at the **ContentIntegrity** level over
-the whole archive; any failed dimension or operational error aborts.
+the whole archive; any failed dimension, operational error or report exit
+code 1 aborts (exit code 2 is the normal "degraded" result in 1.0).
 The cost of the last step grows with the month's archive size (it reads
 every chunk once per session). Any failure leaves `/staging` and the
 manifest untouched.
@@ -309,6 +328,9 @@ together. Its steps, in order:
    matchable now if its STM file only shows up in this run. The
    "already scanned" check is only used later, to avoid re-inserting
    a duplicate `session_barcode` row.
+0. **Validate subfolders.** Each configured subfolder must be a single
+   plain path component (no `/`, `\\`, `..`, `:`, empty); otherwise the
+   session fails at once with a configuration error.
 4. **Scan** each configured subfolder (`BURNIN`, `ESS`, `JTAG`, `STM`,
    `Xray`). For each file: filter by allowed extension, run the
    boundary-aware Aho-Corasick matcher (a match must be flanked by
@@ -328,11 +350,12 @@ together. Its steps, in order:
    (`matched` or `no_files_found`), batched inside a single
    transaction (avoids one disk sync per row at scale — relevant at
    ~200k+ candidates per run).
-7. **Stage.** For each matched file: `fs::rename` it from the source
-   tree into `/staging/<subfolder>/<filename>`, then immediately
-   append its entry to `manifest.jsonl` (see §7). Recording only
-   *after* the rename succeeds is what keeps the manifest an accurate
-   record of what's actually on disk in staging.
+7. **Stage.** Entries are written to `manifest.jsonl` and **flushed
+   before** the files they describe are renamed, in batches of 500; then
+   each file is `fs::rename`d from the source tree into
+   `/staging/<subfolder>/<filename>` (see §7). A renamed file can therefore
+   never be missing from the manifest; a listed file that was not renamed
+   yet is simply still in the source tree.
 8. **Archive + verify + cleanup** — delegated to `finish_staged_batch`
    (shared with the resume path in step 1):
    - Group staged entries by target volume (`YYYY-MM`).
@@ -349,8 +372,12 @@ together. Its steps, in order:
    - Upsert `file_storage_volume` (head commit id/seq) and
      `scanned_log_entry` rows (content hash, commit seq) for every
      verified entry.
-   - Only after **every** touched volume passes verification is
-     `/staging` removed in its entirety.
+   - Only after **every** touched volume passes verification is staging
+     cleaned up, and only selectively: the verified files **listed in the
+     manifest** are deleted, then `manifest.jsonl`, then directories that
+     are now empty. Anything else still in staging (e.g. a file renamed in
+     by a crashed run whose manifest line was lost) is **never deleted**:
+     it stays, is counted in `errors`, and a warning names it.
 9. **Complete the session row** (status `success`, final counters).
 
 ### Multi-volume-per-run handling
@@ -411,12 +438,13 @@ Format: append-only, line-delimited JSON.
 
 - **Header line** (`scan_session_id`) is written once, before any
   file is staged.
-- **One line per file**, appended immediately after that file's
-  `fs::rename` into staging succeeds — never written ahead of time.
-- **Flushed every 500 entries** (`StagingManifestWriter::FLUSH_EVERY`)
-  and once more when staging finishes. This bounds a crash's blast
-  radius to at most ~500 staged-but-unrecorded files, while avoiding
-  an fsync per file.
+- **One line per file**, written and flushed *before* that file's
+  `fs::rename` into staging. Lines go out in batches of 500
+  (`StagingManifestWriter::FLUSH_EVERY`): the whole batch is flushed first,
+  then its files are renamed. Consequence: every file that exists in
+  staging is listed. The reverse can be false after a crash (listed, but
+  not yet renamed): on resume such a file is skipped as absent from
+  staging, and it is still in the source tree, so nothing is lost.
 - **On read**, a missing or corrupt header means "nothing safe to
   resume" (treated as no manifest, not an error). A truncated final
   line (a flush caught mid-crash) is skipped rather than failing the
@@ -559,16 +587,16 @@ used as the return type throughout the crate.
 
 | Test file | Focus | Count |
 |---|---|---|
-| `tests/mochi_store.rs` | Byte-identical round trip, dir entries, append = new commit, commit splitting, idempotent re-store, verification failures, bit-flip, uncommitted tail / lock conflict surfaced and not truncated, MOCHI error codes | 11 |
+| `tests/mochi_store.rs` | Byte-identical round trip, skip-identical resume, dir entries, append = new commit, commit splitting, idempotent re-store, verification failures, bit-flip, uncommitted tail / lock conflict surfaced and not truncated, MOCHI error codes | 12 |
 | `tests/mochi_index.rs` | Schema columns and version, legacy-DB detection, unique constraints, upsert/idempotent inserts, head tracking across appends | 10 |
 | `tests/mochi_extraction.rs` | Extraction by barcode / filename through the index, missing entry, `safe_join` and hostile index paths | 5 |
 | `tests/phase4_db_and_matching.rs` | Query builder, resume-window date math, matcher boundary logic | 10 |
-| `tests/mochi_session_flow.rs` | Full flow, second session appends a commit, crash after staging, crash after commit but before index (no loss/duplication), failed archive keeps staging | 5 |
+| `tests/mochi_session_flow.rs` | Unlisted staging files survive cleanup, subfolder validation, unrenamed listed file, full flow, second session appends a commit, crash after staging, crash after commit but before index (no loss/duplication), failed archive keeps staging | 8 |
 | `tests/mochi_file_viewer.rs` | Whole-volume listing/extraction/overwrite, bounded preview | 5 |
 | `tests/secure_config.rs` | Round-trip, tamper detection, wrong-key rejection | 8 |
 | `src/email_report.rs` (inline) | Size-budget shrinking, escaping | 3 |
 | `src/session.rs` (inline) | Manifest round trip, truncated-line tolerance, orphaned-session-id recovery | 3 |
-| **Total (`archiver_core`)** | | **60** |
+| **Total (`archiver_core`)** | | **64** |
 
 `ui` has 2 further settings tests.
 
