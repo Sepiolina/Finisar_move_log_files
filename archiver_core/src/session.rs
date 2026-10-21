@@ -2,8 +2,9 @@
 //! 1. Query the database for files that need to be archived.
 //! 2. Scan source folders for these files (using fast text search).
 //! 3. Safely move matched files into a temporary `/staging` folder.
-//! 4. Compress files from `/staging` into `.tar.zst` archives, grouped by month.
-//! 5. Verify the compressed files in memory to ensure data integrity.
+//! 4. Commit files from `/staging` into monthly MOCHI archives (`YYYY-MM.mochi`).
+//! 5. Verify each archive read-only (content hashes vs the staged files, plus
+//!    MOCHI's content-level verification) before touching staging.
 //! 6. Delete the `/staging` files and save the completion status to the DB.
 //!
 //! **Crash Safety:** If the program crashes, no data is lost. The staging 
@@ -12,15 +13,14 @@
 use crate::db::ArchivalCandidate;
 use crate::error::{ArchiveError, Result};
 use crate::matcher::{has_matching_extension, BarcodeMatcher};
-use crate::reader::verify_chunk_in_ram;
+use crate::mochi_store::{self, StoreFile};
 use crate::repo::{self, BarcodeStatus, SessionStatus};
-use crate::writer::ChunkedArchiveWriter;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A single file moved to the staging area, waiting to be compressed.
+/// A single file moved to the staging area, waiting to be archived.
 #[derive(Debug, Clone)]
 pub struct StagedFile {
     pub staged_path: PathBuf,
@@ -168,8 +168,6 @@ pub struct SessionConfig {
     pub staging_dir: PathBuf,
     pub subfolders: Vec<String>,
     pub allowed_extensions: Vec<String>,
-    /// Standard compression is 1-22. Negative numbers enable fast mode.
-    pub compression_level: i32,
     pub lookback_days: i64,
     /// Manual override to scan a specific date range (e.g., historical backfill) 
     /// instead of automatically calculating from the last run.
@@ -496,7 +494,7 @@ where
     })
 }
 
-/// Compresses files from `/staging` into `.tar.zst` files, verifies them, 
+/// Commits files from `/staging` into monthly `.mochi` archives, verifies them, 
 /// and cleans up the `/staging` folder on success.
 fn finish_staged_batch<F>(
     conn: &mut Connection,
@@ -531,47 +529,52 @@ where
     let mut archive_breakdown: Vec<VolumeBreakdown> = Vec::new();
 
     for (volume_name, entries) in &by_volume {
-        let volume_path = config
-            .output_dir
-            .join(year_from_volume_name(volume_name))
-            .join(format!("{volume_name}.tar.zst"));
+        let volume_path = mochi_store::volume_path(&config.output_dir, volume_name);
 
-        let mut writer = ChunkedArchiveWriter::open_or_append(&volume_path, config.compression_level)?;
+        // Only files still present in staging are archived (resume tolerance).
         let mut staged_present: Vec<StagedManifestEntry> = Vec::new();
-
+        let mut store_files: Vec<StoreFile> = Vec::new();
         for entry in entries {
             processed += 1;
             if processed % 250 == 0 || processed == total_to_archive {
                 if let Some(cb) = progress_callback {
-                    cb(format!("Compressing file {} of {} ({volume_name})...", processed, total_to_archive), processed, total_to_archive);
+                    cb(format!("Preparing file {} of {} ({volume_name})...", processed, total_to_archive), processed, total_to_archive);
                 }
             }
-
             let staged_path = config.staging_dir.join(&entry.relative_path);
             if !staged_path.exists() {
                 continue;
             }
-            let file = fs::File::open(&staged_path).map_err(|e| ArchiveError::io(&staged_path, e))?;
-            writer.add_file(&entry.relative_path, file, entry.original_size)?;
+            store_files.push(StoreFile {
+                relative_path: entry.relative_path.clone(),
+                staged_path,
+            });
             staged_present.push((*entry).clone());
+        }
+        if store_files.is_empty() {
+            continue;
         }
 
         if let Some(cb) = progress_callback {
-            cb(format!("Finalizing chunk and verifying archive in RAM for {volume_name}..."), processed, total_to_archive);
+            cb(format!("Committing {} file(s) to {volume_name}.mochi...", store_files.len()), processed, total_to_archive);
         }
+        let finished = mochi_store::store_volume(&volume_path, &store_files)?;
 
-        let finished = writer.finish()?;
-
-        // Verify the compressed files directly in memory before deleting any originals.
-        let mut verified_count = 0usize;
-        for span in &finished.chunk_spans {
-            verified_count += verify_chunk_in_ram(&finished.path, span.chunk_start_byte, span.chunk_end_byte)?;
+        if let Some(cb) = progress_callback {
+            cb(format!("Verifying committed archive {volume_name}.mochi (read-only)..."), processed, total_to_archive);
         }
-        if verified_count < staged_present.len() {
-            return Err(ArchiveError::Config(format!(
-                "Verification found {verified_count} entries in {volume_name} but expected {}. Aborting cleanup.",
-                staged_present.len()
-            )));
+        // Verify before deleting any originals. Any failure aborts here and
+        // leaves staging and the manifest untouched.
+        mochi_store::verify_volume(&volume_path, &store_files)?;
+        if finished.entry_count < staged_present.len() {
+            return Err(ArchiveError::VerificationFailed {
+                volume: volume_name.clone(),
+                reason: format!(
+                    "committed {} entries but expected {}. Aborting cleanup.",
+                    finished.entry_count,
+                    staged_present.len()
+                ),
+            });
         }
 
         let now = started_at_now();
@@ -609,7 +612,7 @@ where
         cb("Verification complete across all months. Cleaning up staging area...".to_string(), total_to_archive, total_to_archive);
     }
 
-    // 4. Cleanup: Now that everything is compressed, verified, and saved to the DB,
+    // 4. Cleanup: Now that everything is committed, verified, and saved to the DB,
     // we can safely delete the temporary staging folder.
     let files_deleted = all_staged_present.len();
     fs::remove_dir_all(&config.staging_dir).map_err(|e| ArchiveError::io(&config.staging_dir, e))?;
@@ -643,10 +646,6 @@ where
         unmatched_barcodes: Vec::new(),
         files_deleted,
     })
-}
-
-fn year_from_volume_name(volume_name: &str) -> String {
-    volume_name.split('-').next().unwrap_or(volume_name).to_string()
 }
 
 fn started_at_now() -> String {
@@ -777,7 +776,6 @@ mod tests {
             staging_dir: staging_dir.clone(),
             subfolders: vec!["BURNIN".into()],
             allowed_extensions: vec!["txt".into()],
-            compression_level: 3,
             lookback_days: 2,
             date_range_override: None,
         };

@@ -1,7 +1,7 @@
 //! Phase 6 — persisted UI settings.
 //!
 //! Per spec: "Persist on close: last source/output paths, extension
-//! filter, compression level, last-successful-scan date." Stored as a
+//! filter, last-successful-scan date." Stored as a
 //! flat JSON file via `directories-next` (already pulled in transitively
 //! by `eframe`'s persistence feature, so no new dependency) rather than
 //! `eframe`'s own `App::save` mechanism — that ties persistence to
@@ -20,7 +20,6 @@ pub struct UiSettings {
     pub staging_dir: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
     pub extension_filter: Vec<String>,
-    pub compression_level: i32,
     /// TEXT-form date (YYYY-MM-DD) of the last successful scan's
     /// query_to_date — read back from the SQLite index at startup
     /// (`repo::last_successful_scan_to_date`) rather than duplicated
@@ -52,7 +51,6 @@ impl Default for UiSettings {
             staging_dir: None,
             db_path: None,
             extension_filter: vec!["txt".to_string(), "zip".to_string()],
-            compression_level: 19,
             last_successful_scan_to_date: None,
             dry_run: false,
             email_stats_enabled: false,

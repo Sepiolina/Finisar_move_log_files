@@ -1,87 +1,127 @@
-//! Reads parts (chunks) of a volume file back out.
-//! Used to verify freshly written chunks in memory, or to extract specific files by jumping straight to their location.
+//! Reads MOCHI volumes back: list, extract, preview.
+//!
+//! Everything goes through `mochi-core`'s verified read path (`read::list`,
+//! `read::read_file`). Archive-supplied names are untrusted: whenever a file
+//! is written to disk its destination is built with [`safe_join`], which
+//! accepts only plain path components (no `..`, no root, no drive prefix).
+//! Extraction writes to a temporary sibling file and renames it into place only
+//! after `read_file` returned `Ok`, so a damaged file is never published.
 
-use crate::error::{ ArchiveError, Result };
+use crate::error::{ArchiveError, Result};
+use crate::mochi_store::archive_path_of;
+use mochi_core::catalog::namespace::EntryKind;
+use mochi_core::job::{CancellationToken, JobContext, NullProgress};
+use mochi_core::publish::{open_head, OpenedHead, ReadOptions};
+use mochi_core::storage::os::OsReadStorage;
+use mochi_core::MochiError;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{ Read, Seek, SeekFrom, Take };
-use std::path::Path;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
-/// Opens a specific section of a file as its own standalone archive.
-pub fn open_chunk_as_tar(
-    volume_path: &Path,
-    chunk_start_byte: u64,
-    chunk_end_byte: u64
-) -> Result<tar::Archive<zstd::stream::Decoder<'static, std::io::BufReader<Take<File>>>>> {
-    let mut file = File::open(volume_path).map_err(|e| ArchiveError::io(volume_path, e))?;
-    file.seek(SeekFrom::Start(chunk_start_byte)).map_err(|e| ArchiveError::io(volume_path, e))?;
-    let bounded = file.take(chunk_end_byte - chunk_start_byte);
-    let decoder = zstd::stream::Decoder::new(bounded).map_err(ArchiveError::Zstd)?;
-    Ok(tar::Archive::new(decoder))
+/// An opened, read-only volume.
+struct OpenVolume {
+    src: OsReadStorage,
+    head: OpenedHead,
+    ro: ReadOptions,
+    path: PathBuf,
 }
 
-/// Tests a chunk in memory right after saving to make sure the data is intact.
-/// Returns the total number of files found inside.
-pub fn verify_chunk_in_ram(
-    volume_path: &Path,
-    chunk_start_byte: u64,
-    chunk_end_byte: u64
-) -> Result<usize> {
-    let mut archive = open_chunk_as_tar(volume_path, chunk_start_byte, chunk_end_byte)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
-    let mut count = 0usize;
-    for entry in entries {
-        let mut entry = entry.map_err(ArchiveError::Tar)?;
-        let mut sink = std::io::sink();
-        std::io::copy(&mut entry, &mut sink).map_err(|e| ArchiveError::io(volume_path, e))?;
-        count += 1;
+impl OpenVolume {
+    fn open(volume_path: &Path) -> Result<Self> {
+        let map = |e: MochiError| ArchiveError::from_mochi(volume_path, e);
+        let src = OsReadStorage::open(volume_path).map_err(|e| map(MochiError::from(e)))?;
+        let ro = ReadOptions::default();
+        let head = open_head(&src, &ro).map_err(map)?;
+        Ok(OpenVolume {
+            src,
+            head,
+            ro,
+            path: volume_path.to_path_buf(),
+        })
     }
-    Ok(count)
-}
 
-/// Quickly jumps directly to a chunk, then searches inside it to extract a specific file to disk.
-/// Note: Jumping to the chunk is instant, but scanning inside it takes a bit of time.
-pub fn extract_file_from_chunk(
-    volume_path: &Path,
-    chunk_start_byte: u64,
-    chunk_end_byte: u64,
-    relative_path: &str,
-    dest_path: &Path
-) -> Result<u64> {
-    let mut archive = open_chunk_as_tar(volume_path, chunk_start_byte, chunk_end_byte)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
+    fn map(&self, e: MochiError) -> ArchiveError {
+        ArchiveError::from_mochi(&self.path, e)
+    }
 
-    for entry in entries {
-        let mut entry = entry.map_err(ArchiveError::Tar)?;
-        let entry_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        if entry_path != relative_path {
-            continue;
-        }
-
-        if let Some(parent) = dest_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+    /// Streams the file at `relative_path` into `out` (verified only once
+    /// this returns `Ok`). Returns the logical length.
+    fn read_file(&self, relative_path: &str, out: &mut dyn Write) -> Result<u64> {
+        let path = archive_path_of(relative_path)?;
+        let cancel = CancellationToken::new();
+        let ctx = JobContext {
+            progress: &NullProgress,
+            cancel: &cancel,
+        };
+        match mochi_core::read::read_file(&self.src, &self.head, &path, out, &self.ro, &ctx) {
+            Ok(r) => Ok(r.logical_len),
+            Err(e) if e.code == mochi_core::ErrorCode::InvalidArgument && e.message.starts_with("no entry") => {
+                Err(ArchiveError::EntryNotFound(relative_path.to_string()))
             }
+            Err(e) => Err(self.map(e)),
         }
-        let mut out = File::create(dest_path).map_err(|e| ArchiveError::io(dest_path, e))?;
-        let bytes = std::io
-            ::copy(&mut entry, &mut out)
-            .map_err(|e| ArchiveError::io(dest_path, e))?;
-        return Ok(bytes);
     }
 
-    Err(ArchiveError::EntryNotFound(relative_path.to_string()))
+    /// Logical size of a file entry, if present.
+    fn file_size(&self, relative_path: &str) -> Result<Option<u64>> {
+        let path = archive_path_of(relative_path)?;
+        let list = mochi_core::read::list(&self.head, Some(&path)).map_err(|e| self.map(e))?;
+        Ok(list
+            .into_iter()
+            .find(|e| e.path == path && e.kind == EntryKind::File)
+            .map(|e| e.logical_len))
+    }
 }
 
-/// Opens the entire volume file as one giant stream, reading all chunks back-to-back.
-pub fn open_volume_as_tar(
-    volume_path: &Path
-) -> Result<tar::Archive<zstd::stream::Decoder<'static, std::io::BufReader<File>>>> {
-    let file = File::open(volume_path).map_err(|e| ArchiveError::io(volume_path, e))?;
-    let decoder = zstd::stream::Decoder::new(file).map_err(ArchiveError::Zstd)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.set_ignore_zeros(true);
-    Ok(archive)
+/// Joins an archive-relative path (`/`-separated) onto `root`, accepting only
+/// plain components. Rejects `..`, `.`, empty components, absolute paths and
+/// Windows drive/UNC prefixes.
+pub fn safe_join(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        return Err(ArchiveError::UnsafePath(relative_path.to_string()));
+    }
+    let mut out = root.to_path_buf();
+    for part in relative_path.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(ArchiveError::UnsafePath(relative_path.to_string()));
+        }
+        // On Windows `\` and `C:` would be re-interpreted by Path; Components
+        // exposes that as non-Normal.
+        let mut comps = Path::new(part).components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(_)), None) => out.push(part),
+            _ => return Err(ArchiveError::UnsafePath(relative_path.to_string())),
+        }
+    }
+    Ok(out)
+}
+
+/// Reads one entry into `dest_path` via a temporary sibling file that is
+/// renamed into place only after a verified read.
+fn write_entry_to(vol: &OpenVolume, relative_path: &str, dest_path: &Path) -> Result<u64> {
+    if let Some(parent) = dest_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+        }
+    }
+    let file_name = dest_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "extracted".to_string());
+    let tmp = dest_path.with_file_name(format!(".{file_name}.partial"));
+    let result = (|| -> Result<u64> {
+        let mut out = File::create(&tmp).map_err(|e| ArchiveError::io(&tmp, e))?;
+        let n = vol.read_file(relative_path, &mut out)?;
+        out.flush().map_err(|e| ArchiveError::io(&tmp, e))?;
+        drop(out);
+        std::fs::rename(&tmp, dest_path).map_err(|e| ArchiveError::io(dest_path, e))?;
+        Ok(n)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A simple record of a file's path and size when browsing the full volume.
@@ -91,21 +131,23 @@ pub struct VolumeEntry {
     pub size: u64,
 }
 
-/// Lists every file in the volume without loading their contents.
-/// This keeps it fast and memory-efficient while updating a progress counter for the UI.
+/// Lists every file in the volume (directories are skipped) without reading
+/// any file content. `on_progress` receives the running count.
 pub fn list_volume_entries(
     volume_path: &Path,
-    mut on_progress: impl FnMut(usize)
+    mut on_progress: impl FnMut(usize),
 ) -> Result<Vec<VolumeEntry>> {
-    let mut archive = open_volume_as_tar(volume_path)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
+    let vol = OpenVolume::open(volume_path)?;
+    let listing = mochi_core::read::list(&vol.head, None).map_err(|e| vol.map(e))?;
     let mut out = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(ArchiveError::Tar)?;
-        let relative_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        let size = entry.header().size().map_err(ArchiveError::Tar)?;
-        out.push(VolumeEntry { relative_path, size });
+    for e in listing {
+        if e.kind != EntryKind::File {
+            continue;
+        }
+        out.push(VolumeEntry {
+            relative_path: String::from_utf8_lossy(e.path.as_stored()).into_owned(),
+            size: e.logical_len,
+        });
         if out.len() % 500 == 0 {
             on_progress(out.len());
         }
@@ -114,61 +156,41 @@ pub fn list_volume_entries(
     Ok(out)
 }
 
-/// Searches the whole volume from the beginning to extract a specific file.
-/// This is slower than `extract_file_from_chunk` because it doesn't know where to jump to first.
+/// Extracts one file to `dest_path` (overwriting). Returns bytes written.
 pub fn extract_entry_from_volume(
     volume_path: &Path,
     relative_path: &str,
-    dest_path: &Path
+    dest_path: &Path,
 ) -> Result<u64> {
-    let mut archive = open_volume_as_tar(volume_path)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(ArchiveError::Tar)?;
-        let entry_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        if entry_path != relative_path {
-            continue;
-        }
-
-        if let Some(parent) = dest_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
-            }
-        }
-        let mut out = File::create(dest_path).map_err(|e| ArchiveError::io(dest_path, e))?;
-        let bytes = std::io
-            ::copy(&mut entry, &mut out)
-            .map_err(|e| ArchiveError::io(dest_path, e))?;
-        return Ok(bytes);
-    }
-
-    Err(ArchiveError::EntryNotFound(relative_path.to_string()))
+    let vol = OpenVolume::open(volume_path)?;
+    write_entry_to(&vol, relative_path, dest_path)
 }
 
-/// Extracts every single file in the volume into a target folder, keeping the original folder structure.
+/// Keeps track of a file's original name, where it was saved, and how many bytes were written.
+#[derive(Debug, Clone)]
+pub struct ExtractedFile {
+    pub relative_path: String,
+    pub dest_path: PathBuf,
+    pub bytes_written: u64,
+}
+
+/// Extracts every file of the volume into `dest_dir`, keeping the
+/// `<SUBFOLDER>/<filename>` layout. Existing files are overwritten.
 pub fn extract_all_from_volume(
     volume_path: &Path,
     dest_dir: &Path,
-    mut on_progress: impl FnMut(usize)
+    mut on_progress: impl FnMut(usize),
 ) -> Result<Vec<ExtractedFile>> {
-    let mut archive = open_volume_as_tar(volume_path)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
+    let vol = OpenVolume::open(volume_path)?;
+    let listing = mochi_core::read::list(&vol.head, None).map_err(|e| vol.map(e))?;
     let mut results = Vec::new();
-    for entry in entries {
-        let mut entry = entry.map_err(ArchiveError::Tar)?;
-        let relative_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        let dest_path = dest_dir.join(&relative_path);
-        if let Some(parent) = dest_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
-            }
+    for e in listing {
+        if e.kind != EntryKind::File {
+            continue;
         }
-        let mut out = File::create(&dest_path).map_err(|e| ArchiveError::io(&dest_path, e))?;
-        let bytes_written = std::io
-            ::copy(&mut entry, &mut out)
-            .map_err(|e| ArchiveError::io(&dest_path, e))?;
+        let relative_path = String::from_utf8_lossy(e.path.as_stored()).into_owned();
+        let dest_path = safe_join(dest_dir, &relative_path)?;
+        let bytes_written = write_entry_to(&vol, &relative_path, &dest_path)?;
         results.push(ExtractedFile {
             relative_path,
             dest_path,
@@ -179,89 +201,103 @@ pub fn extract_all_from_volume(
     Ok(results)
 }
 
-/// Loads a small piece of a file into memory so you can preview it without saving it to disk.
+/// A `Write` sink that keeps at most `limit` bytes and then aborts the read.
+struct BoundedSink {
+    buf: Vec<u8>,
+    limit: usize,
+    full: bool,
+}
+
+impl Write for BoundedSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = self.limit - self.buf.len();
+        if data.len() > room {
+            self.buf.extend_from_slice(&data[..room]);
+            self.full = true;
+            return Err(std::io::Error::other("preview limit reached"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Loads at most `max_bytes` from the start of a file into memory. The
+/// bool is `true` if the file is longer. The read is stopped early, so the
+/// whole-file hash is not checked for a truncated preview (each chunk read
+/// is still hash-verified).
 pub fn preview_entry_from_volume(
     volume_path: &Path,
     relative_path: &str,
-    max_bytes: u64
+    max_bytes: u64,
 ) -> Result<(Vec<u8>, bool)> {
-    let mut archive = open_volume_as_tar(volume_path)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
-    for entry in entries {
-        let entry = entry.map_err(ArchiveError::Tar)?;
-        let entry_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        if entry_path != relative_path {
-            continue;
-        }
-        let full_size = entry.header().size().map_err(ArchiveError::Tar)?;
-        let mut limited = entry.take(max_bytes);
-        let mut buf = Vec::new();
-        limited.read_to_end(&mut buf).map_err(|e| ArchiveError::io(volume_path, e))?;
-        return Ok((buf, full_size > max_bytes));
+    let vol = OpenVolume::open(volume_path)?;
+    let full_size = vol
+        .file_size(relative_path)?
+        .ok_or_else(|| ArchiveError::EntryNotFound(relative_path.to_string()))?;
+    let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut sink = BoundedSink {
+        buf: Vec::new(),
+        limit,
+        full: false,
+    };
+    match vol.read_file(relative_path, &mut sink) {
+        Ok(_) => Ok((sink.buf, false)),
+        Err(_) if sink.full => Ok((sink.buf, full_size > max_bytes)),
+        Err(e) => Err(e),
     }
-
-    Err(ArchiveError::EntryNotFound(relative_path.to_string()))
 }
 
-/// Quickly jumps to a chunk to find a file, but keeps it in memory instead of saving it.
-/// Useful for small files or quick previews.
-pub fn extract_file_from_chunk_to_bytes(
+/// Extracts one entry of a volume to memory (whole file).
+pub fn extract_entry_to_bytes(volume_path: &Path, relative_path: &str) -> Result<Vec<u8>> {
+    let vol = OpenVolume::open(volume_path)?;
+    let mut buf = Vec::new();
+    vol.read_file(relative_path, &mut buf)?;
+    Ok(buf)
+}
+
+/// Extracts one indexed entry (located through the SQLite index) to `dest_path`.
+/// Replaces the old chunk-offset based extraction: MOCHI needs no offsets.
+pub fn extract_file_from_volume(
     volume_path: &Path,
-    chunk_start_byte: u64,
-    chunk_end_byte: u64,
-    relative_path: &str
-) -> Result<Vec<u8>> {
-    let mut archive = open_chunk_as_tar(volume_path, chunk_start_byte, chunk_end_byte)?;
-    let entries = archive.entries().map_err(ArchiveError::Tar)?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(ArchiveError::Tar)?;
-        let entry_path = entry.path().map_err(ArchiveError::Tar)?.to_string_lossy().to_string();
-        if entry_path != relative_path {
-            continue;
-        }
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf).map_err(|e| ArchiveError::io(volume_path, e))?;
-        return Ok(buf);
-    }
-
-    Err(ArchiveError::EntryNotFound(relative_path.to_string()))
+    relative_path: &str,
+    dest_path: &Path,
+) -> Result<u64> {
+    extract_entry_from_volume(volume_path, relative_path, dest_path)
 }
 
-/// Keeps track of a file's original name, where it was saved, and how many bytes were written.
-#[derive(Debug, Clone)]
-pub struct ExtractedFile {
-    pub relative_path: String,
-    pub dest_path: std::path::PathBuf,
-    pub bytes_written: u64,
-}
-
-/// Uses the database to find all files related to a barcode, then quickly extracts them straight from their exact chunks.
+/// Uses the index to find all files for a barcode and extracts them into
+/// `dest_dir/<SUBFOLDER>/<filename>`.
 pub fn extract_by_barcode(
     conn: &rusqlite::Connection,
     barcode: &str,
-    dest_dir: &Path
+    dest_dir: &Path,
 ) -> Result<Vec<ExtractedFile>> {
     let locations = crate::repo::find_entries_by_barcode(conn, barcode)?;
-    let mut results = Vec::with_capacity(locations.len());
+    extract_locations(&locations, dest_dir)
+}
 
+/// Extracts a set of indexed entries, opening each volume once.
+pub fn extract_locations(
+    locations: &[crate::repo::LogEntryLocation],
+    dest_dir: &Path,
+) -> Result<Vec<ExtractedFile>> {
+    let mut volumes: HashMap<&str, OpenVolume> = HashMap::new();
+    let mut results = Vec::with_capacity(locations.len());
     for loc in locations {
-        let volume_path = Path::new(&loc.volume_path);
-        let dest_path = dest_dir.join(&loc.relative_path);
-        let bytes_written = extract_file_from_chunk(
-            volume_path,
-            loc.chunk_start_byte,
-            loc.chunk_end_byte,
-            &loc.relative_path,
-            &dest_path
-        )?;
+        let dest_path = safe_join(dest_dir, &loc.relative_path)?;
+        if !volumes.contains_key(loc.volume_path.as_str()) {
+            volumes.insert(&loc.volume_path, OpenVolume::open(Path::new(&loc.volume_path))?);
+        }
+        let vol = &volumes[loc.volume_path.as_str()];
+        let bytes_written = write_entry_to(vol, &loc.relative_path, &dest_path)?;
         results.push(ExtractedFile {
-            relative_path: loc.relative_path,
+            relative_path: loc.relative_path.clone(),
             dest_path,
             bytes_written,
         });
     }
-
     Ok(results)
 }

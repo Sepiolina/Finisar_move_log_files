@@ -31,7 +31,7 @@ pub enum Command {
     /// Searches and lists matching files without extracting them.
     Search { db_path: PathBuf, query: String },
 
-    /// Lists all entries inside a compressed `.tar.zst` volume.
+    /// Lists all entries inside a `.mochi` monthly archive.
     ListVolume { volume_path: PathBuf },
     /// Extracts a single file from a volume.
     ExtractFromVolume {
@@ -157,9 +157,13 @@ pub fn spawn() -> (Sender<Command>, Receiver<Progress>, Receiver<Outcome>) {
                 }
                 Command::ExtractFromVolume { volume_path, relative_path, dest_dir } => {
                     let _ = progress_tx.send(Progress::Status(format!("Extracting {relative_path}...")));
-                    let dest_path = dest_dir.join(&relative_path);
-                    let result = archiver_core::reader::extract_entry_from_volume(&volume_path, &relative_path, &dest_path)
-                        .map(|bytes_written| ExtractedFile {
+                    // The archive-supplied name is validated before it becomes a disk path.
+                    let result = archiver_core::reader::safe_join(&dest_dir, &relative_path)
+                        .and_then(|dest_path| {
+                            archiver_core::reader::extract_entry_from_volume(&volume_path, &relative_path, &dest_path)
+                                .map(|bytes_written| (dest_path, bytes_written))
+                        })
+                        .map(|(dest_path, bytes_written)| ExtractedFile {
                             relative_path: relative_path.clone(),
                             dest_path,
                             bytes_written,
@@ -499,21 +503,11 @@ fn extract(db_path: &PathBuf, query: &str, dest_dir: &PathBuf, progress_tx: &Sen
     let locations = repo::find_entries_by_filename_like(&conn, query).map_err(|e| e.to_string())?;
     let total = locations.len() as u32;
     let mut extracted = Vec::with_capacity(locations.len());
-    for (i, loc) in locations.into_iter().enumerate() {
-        let dest_path = dest_dir.join(&loc.relative_path);
-        let bytes_written = archiver_core::reader::extract_file_from_chunk(
-            std::path::Path::new(&loc.volume_path),
-            loc.chunk_start_byte,
-            loc.chunk_end_byte,
-            &loc.relative_path,
-            &dest_path,
-        )
-        .map_err(|e| e.to_string())?;
-        extracted.push(ExtractedFile {
-            relative_path: loc.relative_path,
-            dest_path,
-            bytes_written,
-        });
+    for (i, loc) in locations.iter().enumerate() {
+        extracted.extend(
+            archiver_core::reader::extract_locations(std::slice::from_ref(loc), dest_dir)
+                .map_err(|e| e.to_string())?,
+        );
         let _ = progress_tx.send(Progress::Fraction(i as u32 + 1, total));
     }
     Ok(extracted)
