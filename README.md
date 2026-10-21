@@ -2,16 +2,20 @@
 
 This document describes the design, data flow, and module-by-module
 behavior of the `archiver_core` Rust crate: a tool that finds log
-files matching barcodes queried from SQL Server, packs them into
-chunked, compressed `.tar.zst` volumes organized by month, and
-indexes their exact byte locations in a local SQLite database for
-fast later retrieval.
+files matching barcodes queried from SQL Server, commits them into
+monthly [MOCHI](https://github.com/immerh8/MOCHI) archives
+(`YYYY-MM.mochi`, via the `mochi-core` library), and indexes each
+file's archive path, content hash and commit in a local SQLite
+database for fast later retrieval.
 
-- **43 automated tests** across the crate (`src/` inline tests +
-  `tests/phase*.rs` integration tests).
+- **64 automated tests** in `archiver_core` (`src/` inline tests +
+  `tests/*.rs` integration tests), plus 2 in the `ui` crate.
 - Crash-safe by design: a process kill at any point during a run
-  leaves either fully-archived data or fully-recoverable staged
+  leaves either fully-committed data or fully-recoverable staged
   data — never a file that exists nowhere.
+- **Wording:** a successful write is *committed (`LOCAL_COMMITTED`)*:
+  one local archive file was synced. That is **not** a backup. Keep an
+  independent copy of the output folder (and of the SQLite index).
 
 ---
 
@@ -33,13 +37,12 @@ flowchart TD
     J -- yes --> K[Stage: fs::rename each matched<br/>file into /staging]
     K --> L[Append manifest.jsonl entry<br/>after each successful rename]
     L --> M[Group staged files by<br/>target volume  YYYY-MM]
-    M --> N[For each volume: open/append<br/>ChunkedArchiveWriter]
-    N --> O[Write each file as a tar entry<br/>roll chunk at 50MB uncompressed]
-    O --> P[Finish volume: close chunk,<br/>hash whole file sha256]
-    P --> Q[Verify: decompress every NEW<br/>chunk in RAM, count entries]
-    Q --> R{Verified count<br/>>= staged count?}
+    M --> N[For each volume: create or append<br/>YYYY-MM.mochi, TailRepair::Refuse]
+    N --> O[Commit files in byte-bounded batches<br/>64 MiB per commit, then close writer]
+    O --> P[Reopen archive read-only:<br/>head hash == BLAKE3 of staged file<br/>+ verified read-back + Content verify]
+    P --> R{Every entry present<br/>and hashes equal?}
     R -- no --> S[Abort — leave staging intact<br/>for next run to resume]
-    R -- yes --> T[Upsert file_storage_volume<br/>insert scanned_log_entry rows]
+    R -- yes --> T[Upsert file_storage_volume head<br/>insert scanned_log_entry rows]
     T --> U{More volumes<br/>to process?}
     U -- yes --> N
     U -- no --> V[Remove /staging entirely]
@@ -51,9 +54,10 @@ flowchart TD
 
 **Crash-safety invariant:** a file only ever exists in one place at a
 time — either still in the source tree, or in `/staging`, or inside a
-verified `.tar.zst` volume. `/staging` is only deleted after *every*
-touched month's volume has been independently re-decompressed and
-counted. If a crash happens mid-archive, the next run detects the
+committed and verified `.mochi` archive. `/staging` is only deleted
+after *every* touched month's archive has been re-opened read-only and
+every staged file found in its head with a BLAKE3 hash equal to the
+staged file's. If a crash happens mid-archive, the next run detects the
 leftover `staging/manifest.jsonl` and finishes that batch (step C)
 before doing anything else.
 
@@ -63,9 +67,9 @@ before doing anything else.
 
 | Module | Responsibility |
 |---|---|
-| `writer.rs` | Chunked `.tar.zst` volume writer (the archive engine) |
-| `reader.rs` | Reads chunks/volumes back out — extraction, listing, preview |
-| `schema.rs` | SQLite schema (4 tables) for the offset index |
+| `mochi_store.rs` | Monthly MOCHI archive writer: create-or-append, byte-bounded commits, hashing, read-only verification |
+| `reader.rs` | Reads `.mochi` volumes back out (via `mochi-core`) — extraction, listing, preview, safe path joining |
+| `schema.rs` | SQLite schema (4 tables, `user_version` 2) for the index |
 | `repo.rs` | Typed CRUD over the SQLite index |
 | `matcher.rs` | Boundary-aware Aho-Corasick barcode matching in filenames |
 | `db.rs` | SQL Server (Tiberius) query for archival candidates + resume-window math |
@@ -82,88 +86,149 @@ all).
 
 ---
 
-## 3. The Archive Format — `writer.rs` / `reader.rs`
+## 3. The Archive Format — `mochi_store.rs` / `reader.rs`
 
-Each monthly volume (`2026-08.tar.zst`) is **not** a single zstd
-frame wrapping a single tar stream. It's a sequence of independent
-**chunks**, concatenated in one file:
+Storage is delegated to **MOCHI** (`mochi-core`, pinned to commit
+`b17f600411742f1a1174abce6588be9e88974402`, 0.9.6). A `.mochi` file is
+an append-only chain of **commits**; every commit is a full snapshot of
+a namespace of files and directories, hash-anchored with BLAKE3. The
+program keeps the same *what/how* as before — only the container
+changed:
+
+- **One archive per month**, named from the barcode's retrieved date:
+  `<output_dir>/<YYYY>/<YYYY-MM>.mochi`.
+- **In-archive paths** are the matcher's `relative_path`:
+  `<SUBFOLDER>/<filename>` (`BURNIN/unit1_BC001_log.txt`). The subfolder
+  gets an explicit directory entry (`put_dir`) the first time it is
+  needed (MOCHI requires a file's parent to exist in the head or in the
+  same commit).
+- Each file is stored with its modification time (staged files keep the
+  mtime of the source file because staging is an `fs::rename`).
 
 ```
-[ chunk 1: zstd frame { tar stream + EOF footer } ]
-[ chunk 2: zstd frame { tar stream + EOF footer } ]
-[ chunk 3: zstd frame { tar stream + EOF footer } ]
-...
+2026/2026-08.mochi
+  commit 0   BURNIN/            (dir)
+             BURNIN/unit1_BC001_log.txt
+             ESS/ ...
+  commit 1   (a later session appended more files to the same month)
+  ...
 ```
 
-- A new chunk starts when the previous one is empty (lazy — no chunk
-  is opened until the first file needs one) and rolls over once
-  **50MB of uncompressed data** (`CHUNK_SIZE_THRESHOLD`) has been
-  written into it (checked *after* each file, not pre-emptively).
-- Every chunk gets its own tar end-of-archive footer (two 512-byte
-  zero blocks) and its own finished zstd frame — this is what makes
-  a chunk **independently decompressible**: seek to `chunk_start_byte`,
-  read `chunk_end_byte - chunk_start_byte` bytes, zstd-decompress,
-  and you have a standalone valid `.tar` any standard tool can open.
-- Reading the **whole file** as one continuous stream instead (e.g. to
-  browse every file in a volume) requires `tar --ignore-zeros`,
-  because plain `tar` stops at the first chunk's own footer. zstd
-  itself decodes concatenated frames back-to-back automatically — no
-  special handling needed on that side. `reader::open_volume_as_tar`
-  sets `archive.set_ignore_zeros(true)` to do this correctly.
-- **Appending to an existing volume** never rewrites earlier bytes —
-  `open_or_append` opens the file in append mode and simply starts
-  writing new chunks after whatever's already there.
-- **Integrity:** on `finish()`, the whole volume file is SHA-256
-  hashed (`hash_file`) — re-hashed in full on every append, since
-  there's no incremental shortcut, matching the spec's requirement
-  to recompute `file_size`/`sha256`/`entry_count` on the
-  `file_storage_volume` row after every append.
-- **Compression level:** `clamp_compression_level` asks the linked
-  zstd library for its actual supported range (`zstd::compression_level_range()`)
-  and clamps a requested level into it, so a stale/hand-edited config
-  value degrades gracefully instead of failing the run. Positive
-  values (1–22) are the standard trade-off range; negative values are
-  zstd's "fast" mode (same as the CLI's `--fast=N` flag, level `-N`).
+### Writing — create or append
 
-### Reading a chunk back — the extraction path
+`mochi_store::store_volume(archive_path, &[StoreFile])`:
+
+1. If `YYYY-MM.mochi` does not exist, it is created with
+   `ArchiveWriter::create_in` (never replaces anything). Otherwise it is
+   opened with `ArchiveWriter::open_append_in(.., TailRepair::Refuse)`.
+   Both use `OsIds` and `WriterOptions { record_time: true, .. }` — the
+   default profile: in-archive deduplication on, MOCHI's own Zstandard
+   chunking (we do **not** compress anything ourselves, so there is no
+   compression-level setting any more).
+2. **Bounded commits.** MOCHI holds a commit's content in memory, so the
+   month's staged files are split into several commits whose file bytes
+   stay within `COMMIT_BYTE_BUDGET` (**64 MiB**). A file larger than the
+   budget gets a commit of its own. Each commit is one
+   `LOCAL_COMMITTED` snapshot; small months are a single commit.
+   **Peak memory:** MOCHI keeps a commit's file bytes in memory while it
+   encodes and writes them, so expect roughly the budget (64 MiB) times a
+   small factor for MOCHI's working copies (chunk buffers, encoded frames),
+   i.e. a few hundred MiB at most for normal files. A single file larger
+   than the budget is committed alone and needs that whole file (times the
+   same factor) in memory, so the largest staged file bounds peak RAM.
+3. The writer is closed with `close()` to release the archive's
+   single-writer lock; the head `commit_id` and `seq` are returned.
+
+Errors are mapped into `ArchiveError`: every `MochiError` becomes
+`ArchiveError::Mochi { code, message }` with MOCHI's stable
+`code.as_str()`; two codes get dedicated variants with clear text:
+`LOCK_CONFLICT` → `ArchiveLocked` (another writer holds the archive;
+MOCHI fails fast and never waits — retry the run) and `UNCOMMITTED_TAIL`
+→ `UncommittedTail` (an earlier write was interrupted). **The tail is
+never truncated automatically**: the run aborts, staging is kept, and a
+person has to run `mochi verify` and then `mochi append --truncate-tail`
+(which quarantines the tail first).
+
+Idempotency: before a file is put, the head is checked; if the path is
+already there with an identical BLAKE3 hash the file is **not written
+again** (no duplicate version, nothing read into memory). It is still
+returned in `written_entries` (so it is verified and indexed; its
+`commit_seq` is the head sequence at that moment, i.e. "added at or before
+this commit"). A batch made only of such files makes no new commit. This
+is what makes resuming a batch that was committed but not yet recorded
+free of duplicates. A changed file with the same path is written as a new
+version.
+
+**Durability:** if a commit reports `DirectoryUnconfirmed` (always the
+case for a new archive on Windows), `FinishedVolume.degraded_durability`
+is set and the session logs a `DEGRADED (not an error)` line and lists it
+in `SessionResult.durability_notes`. The data is committed
+(`LOCAL_COMMITTED`) but the directory entry is not confirmed durable; it is
+never shown as success-styled "safe".
+
+### Verification (replaces "decompress a chunk and count")
+
+After the commit, `mochi_store::verify_volume` reopens the archive
+**read-only** (`OsReadStorage` + `open_head`) and, for every staged
+entry, requires:
+
+1. the path is present in the head as a file;
+2. the head's BLAKE3 content hash equals the BLAKE3 of the staged file
+   on disk (hashed again at this point, streaming);
+3. a full `read::read_file` of the stored copy succeeds and its bytes
+   hash to the same value (end-to-end verified read);
+
+and finally runs `verify::verify` at the **ContentIntegrity** level over
+the whole archive; any failed dimension, operational error or report exit
+code 1 aborts (exit code 2 is the normal "degraded" result in 1.0).
+The cost of the last step grows with the month's archive size (it reads
+every chunk once per session). Any failure leaves `/staging` and the
+manifest untouched.
+
+### Reading — the extraction path
 
 ```mermaid
 sequenceDiagram
     participant UI as Caller (barcode)
     participant Repo as repo.rs (SQLite)
     participant Reader as reader.rs
-    participant Vol as volume file (.tar.zst)
+    participant Vol as YYYY-MM.mochi
 
     UI->>Repo: find_entries_by_barcode(barcode)
-    Repo-->>UI: [(relative_path, chunk_start, chunk_end, volume_path), ...]
+    Repo-->>UI: [(relative_path, volume_path, content_hash, commit_seq), ...]
     loop for each matched entry
-        UI->>Reader: extract_file_from_chunk(volume_path, start, end, relative_path)
-        Reader->>Vol: seek(start), bounded read to end
-        Vol-->>Reader: raw chunk bytes
-        Reader->>Reader: zstd-decompress -> tar stream
-        Reader->>Reader: linear scan tar entries for relative_path match
-        Reader-->>UI: bytes written to dest_path
+        UI->>Reader: extract_locations / extract_by_barcode
+        Reader->>Reader: safe_join(dest_dir, relative_path)
+        Reader->>Vol: open_head (read-only), read_file(path)
+        Vol-->>Reader: chunk-verified bytes
+        Reader-->>UI: temp file renamed into place after Ok
     end
 ```
 
-Locating the **chunk** is O(1) (a direct byte-offset seek from the
-SQLite index). Locating the **member within the chunk** is a linear
-scan of that chunk's tar entries, so overall extraction is
-O(entries-in-chunk), not O(1) per file — a chunk holds ≤50MB
-uncompressed worth of files, so this stays fast in practice.
+The SQLite index no longer stores byte offsets: MOCHI's catalog resolves
+a path to its chunks itself, and every chunk is hash-verified as stored
+and decoded bytes while it is read. Extraction writes to a hidden
+`.<name>.partial` sibling and renames it into place only after
+`read_file` returned `Ok` (its output is unverified until then).
 
-`reader.rs` also exposes a **whole-volume path** (no SQLite index
-needed) for browsing an old or orphaned `.tar.zst` directly:
-`list_volume_entries`, `extract_entry_from_volume`,
-`extract_all_from_volume`, and `preview_entry_from_volume` (bounded
-in-memory read, for previewing a file without extracting to disk)
-all linearly scan every chunk in the file.
+`reader.rs` also exposes the **whole-volume path** (no SQLite index
+needed) for browsing any `.mochi` file directly: `list_volume_entries`,
+`extract_entry_from_volume`, `extract_all_from_volume` and
+`preview_entry_from_volume` (bounded in-memory read; it stops after
+`max_bytes`, so the whole-file hash is not checked for a truncated
+preview, though each chunk read is verified).
+
+**Path safety:** archive-supplied (and index-supplied) names are
+untrusted. Every destination is built with `reader::safe_join`, which
+only accepts plain components — no `..`, `.`, empty components, absolute
+paths or Windows drive/UNC prefixes — and returns
+`ArchiveError::UnsafePath` otherwise.
 
 ---
 
-## 4. The SQLite Offset Index — `schema.rs` / `repo.rs`
+## 4. The SQLite Index — `schema.rs` / `repo.rs`
 
-Four tables, schema taken verbatim from spec:
+Four tables:
 
 ```mermaid
 erDiagram
@@ -191,10 +256,11 @@ erDiagram
     }
     file_storage_volume {
         int id PK
-        text path
+        text path "…/YYYY/YYYY-MM.mochi"
         text volume_name "e.g. 2026-08"
         int file_size
-        text sha256
+        text head_commit_id "MOCHI head commit id (hex)"
+        int head_seq "MOCHI head commit sequence"
         int entry_count
         text created_at
         text updated_at
@@ -205,8 +271,8 @@ erDiagram
         text barcode
         text relative_path
         text source_subfolder
-        int chunk_start_byte
-        int chunk_end_byte
+        text content_hash "BLAKE3 hex of the file"
+        int commit_seq "MOCHI commit that added it"
         int original_size
         int file_storage_volume_id FK
     }
@@ -217,16 +283,30 @@ Key constraints:
   dedup mechanism across runs. `repo::record_session_barcode` treats
   a constraint violation as `Ok(None)`, not an error.
 - `scanned_log_entry` is `UNIQUE(relative_path, file_storage_volume_id)`
-  — a given path can only be recorded once per volume. Because of
-  this, `session.rs` explicitly dedups matched files by
-  `relative_path` **before** staging (see §5) so a collision never
-  reaches this constraint mid-transaction.
-- `file_storage_volume.entry_count` is the volume's **cumulative**
-  total across every session that ever appended to it — `repo::upsert_volume`
-  takes a caller-computed cumulative count, not a per-call delta.
+  — a given path is recorded once per volume. `session.rs` dedups matched
+  files by `relative_path` **before** staging (see §5), and
+  `repo::insert_log_entry` is an upsert on that key, so a resumed batch
+  (committed or even recorded before the crash) updates the existing row
+  to the latest committed version instead of failing.
+- `file_storage_volume.head_commit_id` / `head_seq` record the archive
+  head after the last append, so a later `mochi verify --expected-head`
+  can detect a rolled-back or replaced archive. `entry_count` is the
+  number of index rows for the volume.
+- `content_hash` is plain BLAKE3 (the value `b3sum` prints) of the file
+  as committed, for your own integrity cross-checks.
 
-`repo::record_finished_volume` wraps the whole "upsert volume + insert
+`repo::record_finished_volume` wraps the whole "upsert volume + upsert
 every entry" step in a single SQLite transaction.
+
+**Schema version / clean break.** The schema is versioned with
+`PRAGMA user_version` (`schema::SCHEMA_VERSION = 2`). There is **no
+migration** of the old `.tar.zst`/chunk-offset index. `open_and_migrate`
+inspects an unversioned database; if it has the legacy columns
+(`file_storage_volume.sha256` or `scanned_log_entry.chunk_start_byte`) it
+returns `ArchiveError::SchemaMismatch` with a hint to move the old
+database aside (it is left untouched, as are the old `.tar.zst` files);
+a database with a different non-zero version is also refused. A missing
+or empty database is created fresh.
 
 ---
 
@@ -248,6 +328,9 @@ together. Its steps, in order:
    matchable now if its STM file only shows up in this run. The
    "already scanned" check is only used later, to avoid re-inserting
    a duplicate `session_barcode` row.
+0. **Validate subfolders.** Each configured subfolder must be a single
+   plain path component (no `/`, `\\`, `..`, `:`, empty); otherwise the
+   session fails at once with a configuration error.
 4. **Scan** each configured subfolder (`BURNIN`, `ESS`, `JTAG`, `STM`,
    `Xray`). For each file: filter by allowed extension, run the
    boundary-aware Aho-Corasick matcher (a match must be flanked by
@@ -267,33 +350,41 @@ together. Its steps, in order:
    (`matched` or `no_files_found`), batched inside a single
    transaction (avoids one disk sync per row at scale — relevant at
    ~200k+ candidates per run).
-7. **Stage.** For each matched file: `fs::rename` it from the source
-   tree into `/staging/<subfolder>/<filename>`, then immediately
-   append its entry to `manifest.jsonl` (see §7). Recording only
-   *after* the rename succeeds is what keeps the manifest an accurate
-   record of what's actually on disk in staging.
+7. **Stage.** Entries are written to `manifest.jsonl` and **flushed
+   before** the files they describe are renamed, in batches of 500; then
+   each file is `fs::rename`d from the source tree into
+   `/staging/<subfolder>/<filename>` (see §7). A renamed file can therefore
+   never be missing from the manifest; a listed file that was not renamed
+   yet is simply still in the source tree.
 8. **Archive + verify + cleanup** — delegated to `finish_staged_batch`
    (shared with the resume path in step 1):
    - Group staged entries by target volume (`YYYY-MM`).
-   - For each volume: open/append a `ChunkedArchiveWriter`, write
-     every staged file as a tar entry, `finish()` the writer (closes
-     the chunk, hashes the file).
-   - **Verify** every *newly written* chunk by decompressing it in
-     RAM and counting entries (`verify_chunk_in_ram`). If the
-     verified count is less than the staged count for that volume,
-     the whole session aborts *without deleting staging* — the next
-     run will find the manifest and retry.
-   - Upsert `file_storage_volume` and insert `scanned_log_entry` rows
-     for every verified entry.
-   - Only after **every** touched volume passes verification is
-     `/staging` removed in its entirety.
+   - For each volume: `mochi_store::store_volume` creates or appends
+     `<output_dir>/<YYYY>/<YYYY-MM>.mochi` in byte-bounded commits and
+     closes the writer.
+   - **Verify** the committed archive read-only
+     (`mochi_store::verify_volume`): every staged entry present in the
+     head with a BLAKE3 hash equal to the staged file's, a verified
+     read-back, and a `ContentIntegrity` `verify::verify` of the whole
+     archive. Any failure — including `LOCK_CONFLICT` or
+     `UNCOMMITTED_TAIL` when opening — aborts the session *without
+     deleting staging*; the next run finds the manifest and retries.
+   - Upsert `file_storage_volume` (head commit id/seq) and
+     `scanned_log_entry` rows (content hash, commit seq) for every
+     verified entry.
+   - Only after **every** touched volume passes verification is staging
+     cleaned up, and only selectively: the verified files **listed in the
+     manifest** are deleted, then `manifest.jsonl`, then directories that
+     are now empty. Anything else still in staging (e.g. a file renamed in
+     by a crashed run whose manifest line was lost) is **never deleted**:
+     it stays, is counted in `errors`, and a warning names it.
 9. **Complete the session row** (status `success`, final counters).
 
 ### Multi-volume-per-run handling
 
 A single scan can match barcodes from different months (e.g. an
 August scan finding both July-dated and August-dated logs). Each
-month gets its own independently opened/verified `.tar.zst` —
+month gets its own independently opened/verified `.mochi` archive —
 `finish_staged_batch` loops over a `BTreeMap<volume_name, entries>`
 and only deletes staging after the *entire* map has been processed
 successfully.
@@ -347,12 +438,13 @@ Format: append-only, line-delimited JSON.
 
 - **Header line** (`scan_session_id`) is written once, before any
   file is staged.
-- **One line per file**, appended immediately after that file's
-  `fs::rename` into staging succeeds — never written ahead of time.
-- **Flushed every 500 entries** (`StagingManifestWriter::FLUSH_EVERY`)
-  and once more when staging finishes. This bounds a crash's blast
-  radius to at most ~500 staged-but-unrecorded files, while avoiding
-  an fsync per file.
+- **One line per file**, written and flushed *before* that file's
+  `fs::rename` into staging. Lines go out in batches of 500
+  (`StagingManifestWriter::FLUSH_EVERY`): the whole batch is flushed first,
+  then its files are renamed. Consequence: every file that exists in
+  staging is listed. The reverse can be false after a crash (listed, but
+  not yet renamed): on resume such a file is skipped as absent from
+  staging, and it is still in the source tree, so nothing is lost.
 - **On read**, a missing or corrupt header means "nothing safe to
   resume" (treated as no manifest, not an error). A truncated final
   line (a flush caught mid-crash) is skipped rather than failing the
@@ -462,9 +554,13 @@ Content-Type: application/json
 
 A single `ArchiveError` enum (via `thiserror`) covers every failure
 mode across the crate — I/O (with the offending path attached),
-tar/zstd stream errors, SQLite errors, SQL Server errors,
-configuration errors, a duplicate-scan case, a "no matching entry
-found" case for extraction, and email-relay errors. `From` impls
+MOCHI errors (`Mochi { code, message }` carrying the stable MOCHI code,
+plus dedicated `ArchiveLocked` for `LOCK_CONFLICT` and `UncommittedTail`
+for `UNCOMMITTED_TAIL`), post-commit `VerificationFailed`, an
+incompatible-index `SchemaMismatch`, an `UnsafePath` rejection,
+SQLite errors, SQL Server errors, configuration errors, a duplicate-scan
+case, a "no matching entry found" case for extraction, and email-relay
+errors. `From` impls
 exist for `rusqlite::Error` and `tiberius::error::Error` so `?`
 propagates cleanly from either driver. A single `Result<T>` alias is
 used as the return type throughout the crate.
@@ -475,10 +571,9 @@ used as the return type throughout the crate.
 
 | Crate | Purpose |
 |---|---|
-| `tar` | tar stream construction/reading |
-| `zstd` | streaming compression/decompression, frame-based chunking |
-| `sha2` | whole-volume SHA-256 integrity hashing |
-| `rusqlite` (bundled) | SQLite offset index |
+| `mochi-core` (git, pinned rev `b17f600`) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
+| `blake3` | BLAKE3 of staged files (same hash MOCHI records as the content hash) |
+| `rusqlite` 0.40 (bundled) | SQLite index (must match `mochi-core`'s version: both link `sqlite3`) |
 | `aho-corasick` | multi-pattern barcode matching in filenames |
 | `tokio` + `tiberius` + `tokio-util` | async SQL Server connectivity |
 | `serde` / `serde_json` | manifest + encrypted-config (de)serialization |
@@ -492,16 +587,18 @@ used as the return type throughout the crate.
 
 | Test file | Focus | Count |
 |---|---|---|
-| `tests/phase1_chunking.rs` | Chunk rollover, footer correctness, real zstd/tar round-trip | 5 |
-| `tests/phase2_index.rs` | Schema, upsert-on-append, transactional insert | 6 |
-| `tests/phase3_extraction.rs` | Byte-diff verified extraction by barcode | 2 |
+| `tests/mochi_store.rs` | Byte-identical round trip, skip-identical resume, dir entries, append = new commit, commit splitting, idempotent re-store, verification failures, bit-flip, uncommitted tail / lock conflict surfaced and not truncated, MOCHI error codes | 12 |
+| `tests/mochi_index.rs` | Schema columns and version, legacy-DB detection, unique constraints, upsert/idempotent inserts, head tracking across appends | 10 |
+| `tests/mochi_extraction.rs` | Extraction by barcode / filename through the index, missing entry, `safe_join` and hostile index paths | 5 |
 | `tests/phase4_db_and_matching.rs` | Query builder, resume-window date math, matcher boundary logic | 10 |
-| `tests/phase5_session_flow.rs` | Crash-mid-archive-then-rerun (no loss/duplication) | 2 |
-| `tests/phase6_file_viewer.rs` | Whole-volume listing/extraction/preview | 4 |
+| `tests/mochi_session_flow.rs` | Unlisted staging files survive cleanup, subfolder validation, unrenamed listed file, full flow, second session appends a commit, crash after staging, crash after commit but before index (no loss/duplication), failed archive keeps staging | 8 |
+| `tests/mochi_file_viewer.rs` | Whole-volume listing/extraction/overwrite, bounded preview | 5 |
 | `tests/secure_config.rs` | Round-trip, tamper detection, wrong-key rejection | 8 |
 | `src/email_report.rs` (inline) | Size-budget shrinking, escaping | 3 |
-| `src/session.rs` (inline) | Orphaned-session-id recovery | 3 |
-| **Total** | | **43** |
+| `src/session.rs` (inline) | Manifest round trip, truncated-line tolerance, orphaned-session-id recovery | 3 |
+| **Total (`archiver_core`)** | | **64** |
+
+`ui` has 2 further settings tests.
 
 > **Note:** SQL Server connectivity (`db.rs`'s live connection path)
 > is compile-verified only — no reachable SQL Server instance exists

@@ -373,7 +373,7 @@ impl App {
                 }
                 Outcome::VolumeListed(Ok(entries)) => {
                     self.viewer_status = format!(
-                        "{} file(s) found across all chunks.",
+                        "{} file(s) found in this archive.",
                         entries.len()
                     );
                     self.viewer_entries = entries;
@@ -463,7 +463,6 @@ impl App {
             staging_dir,
             subfolders: self.parsed_subfolders(),
             allowed_extensions: self.parsed_extensions(),
-            compression_level: self.settings.compression_level,
             lookback_days: 2,
             date_range_override: self.date_range_override(),
         })
@@ -613,73 +612,16 @@ impl App {
 
                 ui.add_space(4.0);
 
-                ui.horizontal(|ui| {
-                    ui.label("Compression mode:");
-                    let mut fast_mode = self.settings.compression_level < 0;
-                    let was_fast = fast_mode;
-                    ui.radio_value(&mut fast_mode, false, "Standard (levels 1-22)");
-                    ui.radio_value(&mut fast_mode, true, "Fast (zstd --fast=N)");
-                    if fast_mode != was_fast {
-                        self.settings.compression_level = if fast_mode { -4 } else { 19 };
-                        self.settings.save();
-                    }
-                });
-
-                if self.settings.compression_level < 0 {
-                    ui.horizontal(|ui| {
-                        ui.label("zstd --fast= level:");
-                        let mut fast_n = (-self.settings.compression_level).max(1);
-                        if
-                            ui
-                                .add(egui::DragValue::new(&mut fast_n).clamp_range(1..=1000))
-                                .changed()
-                        {
-                            self.settings.compression_level = -fast_n;
-                            self.settings.save();
-                        }
-                        if ui.button("--fast=1").clicked() {
-                            self.settings.compression_level = -1;
-                            self.settings.save();
-                        }
-                        if ui.button("--fast=4").clicked() {
-                            self.settings.compression_level = -4;
-                            self.settings.save();
-                        }
-                    });
-                    ui.colored_label(
-                        egui::Color32::from_rgb(120, 120, 120),
-                        format!(
-                            "Equivalent to the zstd CLI's --fast={}. Trades compression ratio for much higher throughput good for large, low-value, or time-boxed backlogs.",
-                            -self.settings.compression_level
+                ui.label(
+                    egui::RichText
+                        ::new(
+                            "Files are committed (LOCAL_COMMITTED) into one monthly .mochi archive per month. \
+                             MOCHI compresses internally, so there is no compression setting. \
+                             A commit is a local, synced write, not a backup: keep an independent copy of the output folder."
                         )
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Zstd compression level:");
-                        ui.spacing_mut().slider_width = 160.0;
-                        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(
-                            210,
-                            215,
-                            222
-                        );
-                        ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(
-                            190,
-                            197,
-                            207
-                        );
-                        let mut level = self.settings.compression_level;
-                        if ui.add(egui::Slider::new(&mut level, 1..=22)).changed() {
-                            self.settings.compression_level = level;
-                            self.settings.save();
-                        }
-                    });
-                    if self.settings.compression_level >= 19 {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(200, 140, 0),
-                            "19+ is slow — much better ratio, much longer archive time."
-                        );
-                    }
-                }
+                        .small()
+                        .weak()
+                );
 
                 ui.add_space(4.0);
                 ui.checkbox(
@@ -904,8 +846,8 @@ impl App {
                 ui.label(
                     egui::RichText
                         ::new(
-                            "Opening a .tar.zst with a normal archive tool only shows its first internal chunk. \
-                         This reads straight through every chunk in the file."
+                            "Opens a monthly .mochi archive directly (read-only) and lists every file in its \
+                         latest snapshot. Extracted files are verified before they are written to their final name."
                         )
                         .small()
                         .weak()
@@ -926,7 +868,7 @@ impl App {
                         if
                             let Ok(Some(path)) = native_dialog::FileDialog
                                 ::new()
-                                .add_filter("Archive volume", &["zst"])
+                                .add_filter("MOCHI archive", &["mochi"])
                                 .show_open_single_file()
                         {
                             self.viewer_volume_path = Some(path);

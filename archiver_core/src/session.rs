@@ -2,8 +2,9 @@
 //! 1. Query the database for files that need to be archived.
 //! 2. Scan source folders for these files (using fast text search).
 //! 3. Safely move matched files into a temporary `/staging` folder.
-//! 4. Compress files from `/staging` into `.tar.zst` archives, grouped by month.
-//! 5. Verify the compressed files in memory to ensure data integrity.
+//! 4. Commit files from `/staging` into monthly MOCHI archives (`YYYY-MM.mochi`).
+//! 5. Verify each archive read-only (content hashes vs the staged files, plus
+//!    MOCHI's content-level verification) before touching staging.
 //! 6. Delete the `/staging` files and save the completion status to the DB.
 //!
 //! **Crash Safety:** If the program crashes, no data is lost. The staging 
@@ -12,15 +13,14 @@
 use crate::db::ArchivalCandidate;
 use crate::error::{ArchiveError, Result};
 use crate::matcher::{has_matching_extension, BarcodeMatcher};
-use crate::reader::verify_chunk_in_ram;
+use crate::mochi_store::{self, StoreFile};
 use crate::repo::{self, BarcodeStatus, SessionStatus};
-use crate::writer::ChunkedArchiveWriter;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A single file moved to the staging area, waiting to be compressed.
+/// A single file moved to the staging area, waiting to be archived.
 #[derive(Debug, Clone)]
 pub struct StagedFile {
     pub staged_path: PathBuf,
@@ -112,7 +112,7 @@ pub struct StagingManifestWriter {
 
 impl StagingManifestWriter {
     /// How many files to stage before forcing a save to the disk.
-    const FLUSH_EVERY: usize = 500;
+    pub const FLUSH_EVERY: usize = 500;
 
     /// Creates the manifest file and writes the initial session header.
     pub fn create(staging_dir: &Path, scan_session_id: i64) -> Result<Self> {
@@ -145,7 +145,7 @@ impl StagingManifestWriter {
     }
 
     /// Forces unsaved lines to be written to disk.
-    fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         use std::io::Write as _;
         self.file
             .flush()
@@ -168,8 +168,6 @@ pub struct SessionConfig {
     pub staging_dir: PathBuf,
     pub subfolders: Vec<String>,
     pub allowed_extensions: Vec<String>,
-    /// Standard compression is 1-22. Negative numbers enable fast mode.
-    pub compression_level: i32,
     pub lookback_days: i64,
     /// Manual override to scan a specific date range (e.g., historical backfill) 
     /// instead of automatically calculating from the last run.
@@ -188,6 +186,8 @@ pub struct SessionResult {
     pub archive_breakdown: Vec<VolumeBreakdown>,
     pub unmatched_barcodes: Vec<String>,
     pub files_deleted: usize,
+    /// Volumes committed with unconfirmed directory durability (degraded, not an error).
+    pub durability_notes: Vec<String>,
 }
 
 /// Statistics for a specific monthly volume. (For reporting only).
@@ -213,6 +213,26 @@ fn volume_name_from_date(date: &str) -> Result<String> {
     Ok(date[0..7].to_string())
 }
 
+/// Checks that a configured subfolder is a single plain path component: not
+/// empty, no `/` or `\\`, not `.`/`..`, no drive prefix (`:`) and no NUL.
+pub fn validate_subfolder(name: &str) -> Result<()> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '\0'])
+        || name.trim() != name
+        || {
+            let mut c = Path::new(name).components();
+            !matches!((c.next(), c.next()), (Some(std::path::Component::Normal(_)), None))
+        };
+    if bad {
+        return Err(ArchiveError::Config(format!(
+            "invalid subfolder {name:?}: must be a single plain folder name (no '/', '\\', '..', ':' or empty)"
+        )));
+    }
+    Ok(())
+}
+
 /// Runs one complete session: scan, stage, archive, verify, clean up, and record.
 pub fn run_session<F>(
     conn: &mut Connection,
@@ -226,6 +246,10 @@ pub fn run_session<F>(
 where
     F: Fn(String, usize, usize),
 {
+    for sub in &config.subfolders {
+        validate_subfolder(sub)?;
+    }
+
     // 1. Resume interrupted batch: If a previous run crashed leaving files 
     // in staging, finish archiving them before starting a new scan.
     if let Some(manifest) = StagingManifest::read_if_exists(&config.staging_dir)? {
@@ -256,6 +280,7 @@ where
             archive_breakdown: Vec::new(),
             unmatched_barcodes: Vec::new(),
             files_deleted: 0,
+            durability_notes: Vec::new(),
         });
     }
 
@@ -439,6 +464,7 @@ where
             archive_breakdown: Vec::new(),
             unmatched_barcodes,
             files_deleted: 0,
+            durability_notes: Vec::new(),
         });
     }
 
@@ -447,22 +473,34 @@ where
     fs::create_dir_all(&config.staging_dir).map_err(|e| ArchiveError::io(&config.staging_dir, e))?;
     let mut manifest_writer = StagingManifestWriter::create(&config.staging_dir, session_id)?;
 
+    // Crash-correct ordering: a manifest line is written and FLUSHED before
+    // the rename of the file it describes. Lines are written in batches of
+    // FLUSH_EVERY and flushed before any file of that batch is renamed, so a
+    // renamed file can never be missing from the manifest. A listed file that
+    // was not renamed yet is simply still in the source tree (resume skips
+    // listed files that are absent from staging).
     let total_to_stage = manifest_entries.len();
-    for (i, entry) in manifest_entries.iter().enumerate() {
-        if i % 1000 == 0 || i == total_to_stage - 1 {
-            if let Some(cb) = progress_callback {
-                cb(format!("Staging file {} of {}...", i + 1, total_to_stage), i, total_to_stage);
+    for (batch_no, batch) in manifest_entries.chunks(StagingManifestWriter::FLUSH_EVERY).enumerate() {
+        for entry in batch {
+            manifest_writer.record(entry.clone())?;
+        }
+        manifest_writer.flush()?;
+
+        for (j, entry) in batch.iter().enumerate() {
+            let i = batch_no * StagingManifestWriter::FLUSH_EVERY + j;
+            if i % 1000 == 0 || i == total_to_stage - 1 {
+                if let Some(cb) = progress_callback {
+                    cb(format!("Staging file {} of {}...", i + 1, total_to_stage), i, total_to_stage);
+                }
             }
-        }
 
-        let source_path = config.source_dir.join(&entry.relative_path);
-        let staged_path = config.staging_dir.join(&entry.relative_path);
-        if let Some(parent) = staged_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+            let source_path = config.source_dir.join(&entry.relative_path);
+            let staged_path = config.staging_dir.join(&entry.relative_path);
+            if let Some(parent) = staged_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+            }
+            fs::rename(&source_path, &staged_path).map_err(|e| ArchiveError::io(&staged_path, e))?;
         }
-
-        fs::rename(&source_path, &staged_path).map_err(|e| ArchiveError::io(&staged_path, e))?;
-        manifest_writer.record(entry.clone())?;
     }
     manifest_writer.finish()?;
 
@@ -472,6 +510,7 @@ where
     };
 
     let result = finish_staged_batch(conn, config, &manifest, progress_callback)?;
+    let errors = errors + result.errors as i64;
 
     repo::complete_session(
         conn,
@@ -493,10 +532,11 @@ where
         archive_breakdown: result.archive_breakdown,
         unmatched_barcodes,
         files_deleted: result.files_deleted,
+        durability_notes: result.durability_notes,
     })
 }
 
-/// Compresses files from `/staging` into `.tar.zst` files, verifies them, 
+/// Commits files from `/staging` into monthly `.mochi` archives, verifies them, 
 /// and cleans up the `/staging` folder on success.
 fn finish_staged_batch<F>(
     conn: &mut Connection,
@@ -529,49 +569,66 @@ where
     let mut all_staged_present: Vec<StagedManifestEntry> = Vec::new();
     let mut touched_volume_names = Vec::new();
     let mut archive_breakdown: Vec<VolumeBreakdown> = Vec::new();
+    let mut durability_notes: Vec<String> = Vec::new();
 
     for (volume_name, entries) in &by_volume {
-        let volume_path = config
-            .output_dir
-            .join(year_from_volume_name(volume_name))
-            .join(format!("{volume_name}.tar.zst"));
+        let volume_path = mochi_store::volume_path(&config.output_dir, volume_name);
 
-        let mut writer = ChunkedArchiveWriter::open_or_append(&volume_path, config.compression_level)?;
+        // Only files still present in staging are archived (resume tolerance).
         let mut staged_present: Vec<StagedManifestEntry> = Vec::new();
-
+        let mut store_files: Vec<StoreFile> = Vec::new();
         for entry in entries {
             processed += 1;
             if processed % 250 == 0 || processed == total_to_archive {
                 if let Some(cb) = progress_callback {
-                    cb(format!("Compressing file {} of {} ({volume_name})...", processed, total_to_archive), processed, total_to_archive);
+                    cb(format!("Preparing file {} of {} ({volume_name})...", processed, total_to_archive), processed, total_to_archive);
                 }
             }
-
             let staged_path = config.staging_dir.join(&entry.relative_path);
             if !staged_path.exists() {
                 continue;
             }
-            let file = fs::File::open(&staged_path).map_err(|e| ArchiveError::io(&staged_path, e))?;
-            writer.add_file(&entry.relative_path, file, entry.original_size)?;
+            store_files.push(StoreFile {
+                relative_path: entry.relative_path.clone(),
+                staged_path,
+            });
             staged_present.push((*entry).clone());
+        }
+        if store_files.is_empty() {
+            continue;
         }
 
         if let Some(cb) = progress_callback {
-            cb(format!("Finalizing chunk and verifying archive in RAM for {volume_name}..."), processed, total_to_archive);
+            cb(format!("Committing {} file(s) to {volume_name}.mochi...", store_files.len()), processed, total_to_archive);
         }
+        let finished = mochi_store::store_volume(&volume_path, &store_files)?;
 
-        let finished = writer.finish()?;
-
-        // Verify the compressed files directly in memory before deleting any originals.
-        let mut verified_count = 0usize;
-        for span in &finished.chunk_spans {
-            verified_count += verify_chunk_in_ram(&finished.path, span.chunk_start_byte, span.chunk_end_byte)?;
+        if let Some(cb) = progress_callback {
+            cb(format!("Verifying committed archive {volume_name}.mochi (read-only)..."), processed, total_to_archive);
         }
-        if verified_count < staged_present.len() {
-            return Err(ArchiveError::Config(format!(
-                "Verification found {verified_count} entries in {volume_name} but expected {}. Aborting cleanup.",
-                staged_present.len()
-            )));
+        // Verify before deleting any originals. Any failure aborts here and
+        // leaves staging and the manifest untouched.
+        mochi_store::verify_volume(&volume_path, &store_files)?;
+        if let Some(why) = &finished.degraded_durability {
+            // Committed (LOCAL_COMMITTED) but the directory entry is not confirmed durable.
+            if let Some(cb) = progress_callback {
+                cb(
+                    format!("DEGRADED (not an error): {volume_name}.mochi is committed (LOCAL_COMMITTED), but durability of its directory entry is unconfirmed: {why}. Keep an independent copy."),
+                    processed,
+                    total_to_archive,
+                );
+            }
+            durability_notes.push(format!("{volume_name}: {why}"));
+        }
+        if finished.entry_count < staged_present.len() {
+            return Err(ArchiveError::VerificationFailed {
+                volume: volume_name.clone(),
+                reason: format!(
+                    "committed {} entries but expected {}. Aborting cleanup.",
+                    finished.entry_count,
+                    staged_present.len()
+                ),
+            });
         }
 
         let now = started_at_now();
@@ -609,10 +666,42 @@ where
         cb("Verification complete across all months. Cleaning up staging area...".to_string(), total_to_archive, total_to_archive);
     }
 
-    // 4. Cleanup: Now that everything is compressed, verified, and saved to the DB,
-    // we can safely delete the temporary staging folder.
+    // 4. Cleanup: everything below was committed, verified and saved to the DB.
+    // Delete ONLY the files the manifest lists (and that were verified), then the
+    // manifest, then directories that are now empty. Anything else found in
+    // staging (e.g. a file renamed in by a crashed run whose manifest line was
+    // lost) is never deleted: it stays, is counted as an error and reported.
     let files_deleted = all_staged_present.len();
-    fs::remove_dir_all(&config.staging_dir).map_err(|e| ArchiveError::io(&config.staging_dir, e))?;
+    for e in &all_staged_present {
+        let p = config.staging_dir.join(&e.relative_path);
+        match fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(ArchiveError::io(&p, err)),
+        }
+    }
+    let manifest_path = StagingManifest::path_in(&config.staging_dir);
+    match fs::remove_file(&manifest_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ArchiveError::io(&manifest_path, err)),
+    }
+    let mut unlisted: Vec<PathBuf> = Vec::new();
+    prune_empty_dirs(&config.staging_dir, &mut unlisted);
+    let cleanup_errors = unlisted.len();
+    if cleanup_errors > 0 {
+        if let Some(cb) = progress_callback {
+            cb(
+                format!(
+                    "Warning: {cleanup_errors} file(s) in {} were not listed in the staging manifest and were NOT archived or deleted (first: {}). They are left in place; review them manually.",
+                    config.staging_dir.display(),
+                    unlisted[0].display()
+                ),
+                0,
+                0,
+            );
+        }
+    }
 
     repo::complete_session(
         conn,
@@ -625,7 +714,7 @@ where
             .collect::<HashSet<_>>()
             .len() as i64,
         all_staged_present.len() as i64,
-        0,
+        cleanup_errors as i64,
     )?;
 
     Ok(SessionResult {
@@ -636,17 +725,28 @@ where
             .collect::<HashSet<_>>()
             .len(),
         files_moved: all_staged_present.len(),
-        errors: 0,
+        errors: cleanup_errors,
         volume_names: touched_volume_names,
         total_files_scanned: 0,
         archive_breakdown,
         unmatched_barcodes: Vec::new(),
         files_deleted,
+        durability_notes,
     })
 }
 
-fn year_from_volume_name(volume_name: &str) -> String {
-    volume_name.split('-').next().unwrap_or(volume_name).to_string()
+/// Removes empty directories under (and including) `dir`, bottom-up. Files that
+/// remain are appended to `left`; they are never touched.
+fn prune_empty_dirs(dir: &Path, left: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => prune_empty_dirs(&p, left),
+            _ => left.push(p),
+        }
+    }
+    let _ = fs::remove_dir(dir); // fails (harmlessly) if not empty
 }
 
 fn started_at_now() -> String {
@@ -777,7 +877,6 @@ mod tests {
             staging_dir: staging_dir.clone(),
             subfolders: vec!["BURNIN".into()],
             allowed_extensions: vec!["txt".into()],
-            compression_level: 3,
             lookback_days: 2,
             date_range_override: None,
         };

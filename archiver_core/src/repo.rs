@@ -1,7 +1,7 @@
 //! Direct SQL queries for managing scan sessions, storage volumes, and log entries.
 
 use crate::error::{ArchiveError, Result};
-use crate::writer::{ChunkSpan, FinishedVolume};
+use crate::mochi_store::FinishedVolume;
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +137,7 @@ pub fn find_volume_by_name(conn: &Connection, volume_name: &str) -> Result<Optio
     .map_err(ArchiveError::from)
 }
 
-/// Inserts a new volume or updates an existing one with updated size, hash, and totals.
+/// Inserts a new volume or updates an existing one with the new size, MOCHI head and totals.
 pub fn upsert_volume(
     conn: &Connection,
     volume_name: &str,
@@ -151,17 +151,35 @@ pub fn upsert_volume(
         Some(existing_id) => {
             conn.execute(
                 "UPDATE file_storage_volume
-                 SET file_size = ?1, sha256 = ?2, entry_count = ?3, updated_at = ?4
-                 WHERE id = ?5",
-                params![finished.file_size as i64, finished.sha256, cumulative_entry_count, now, existing_id],
+                 SET path = ?1, file_size = ?2, head_commit_id = ?3, head_seq = ?4,
+                     entry_count = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    path_str,
+                    finished.file_size as i64,
+                    finished.head_commit_id,
+                    finished.head_seq as i64,
+                    cumulative_entry_count,
+                    now,
+                    existing_id
+                ],
             )?;
             Ok(existing_id)
         }
         None => {
             conn.execute(
-                "INSERT INTO file_storage_volume (path, volume_name, file_size, sha256, entry_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![path_str, volume_name, finished.file_size as i64, finished.sha256, cumulative_entry_count, now],
+                "INSERT INTO file_storage_volume
+                    (path, volume_name, file_size, head_commit_id, head_seq, entry_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    path_str,
+                    volume_name,
+                    finished.file_size as i64,
+                    finished.head_commit_id,
+                    finished.head_seq as i64,
+                    cumulative_entry_count,
+                    now
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         }
@@ -184,58 +202,81 @@ pub struct LogEntryInsert<'a> {
     pub barcode: &'a str,
     pub relative_path: &'a str,
     pub source_subfolder: &'a str,
-    pub chunk_start_byte: u64,
-    pub chunk_end_byte: u64,
+    /// BLAKE3 (hex) of the stored file's bytes.
+    pub content_hash: &'a str,
+    /// MOCHI commit sequence that added the file.
+    pub commit_seq: u64,
     pub original_size: u64,
     pub file_storage_volume_id: i64,
 }
 
 /// Inserts a log entry and returns its ID.
+///
+/// Idempotent per `(relative_path, volume)`: if the row already exists (a
+/// resumed batch that was recorded but whose staging cleanup was interrupted,
+/// or a newer version of the same file name in the same month) it is updated
+/// in place to describe the latest committed version.
 pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64> {
     conn.execute(
         "INSERT INTO scanned_log_entry
             (scan_session_id, barcode, relative_path, source_subfolder,
-             chunk_start_byte, chunk_end_byte, original_size, file_storage_volume_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             content_hash, commit_seq, original_size, file_storage_volume_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(relative_path, file_storage_volume_id) DO UPDATE SET
+             scan_session_id = excluded.scan_session_id,
+             barcode = excluded.barcode,
+             source_subfolder = excluded.source_subfolder,
+             content_hash = excluded.content_hash,
+             commit_seq = excluded.commit_seq,
+             original_size = excluded.original_size",
         params![
             entry.scan_session_id,
             entry.barcode,
             entry.relative_path,
             entry.source_subfolder,
-            entry.chunk_start_byte as i64,
-            entry.chunk_end_byte as i64,
+            entry.content_hash,
+            entry.commit_seq as i64,
             entry.original_size as i64,
             entry.file_storage_volume_id,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    conn.query_row(
+        "SELECT id FROM scanned_log_entry WHERE relative_path = ?1 AND file_storage_volume_id = ?2",
+        params![entry.relative_path, entry.file_storage_volume_id],
+        |r| r.get(0),
+    )
+    .map_err(ArchiveError::from)
 }
 
-/// File location details used during file extraction.
+/// Where an indexed file lives (used for extraction and search panels).
 #[derive(Debug, Clone)]
 pub struct LogEntryLocation {
     pub relative_path: String,
-    pub chunk_start_byte: u64,
-    pub chunk_end_byte: u64,
     pub volume_path: String,
+    /// BLAKE3 (hex) of the file as committed.
+    pub content_hash: Option<String>,
+    /// MOCHI commit sequence that added the file.
+    pub commit_seq: Option<u64>,
+}
+
+fn location_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntryLocation> {
+    Ok(LogEntryLocation {
+        relative_path: row.get(0)?,
+        volume_path: row.get(1)?,
+        content_hash: row.get(2)?,
+        commit_seq: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+    })
 }
 
 /// Retrieves all log entry locations matching an exact barcode.
 pub fn find_entries_by_barcode(conn: &Connection, barcode: &str) -> Result<Vec<LogEntryLocation>> {
     let mut stmt = conn.prepare(
-        "SELECT sle.relative_path, sle.chunk_start_byte, sle.chunk_end_byte, fsv.path
+        "SELECT sle.relative_path, fsv.path, sle.content_hash, sle.commit_seq
          FROM scanned_log_entry sle
          JOIN file_storage_volume fsv ON fsv.id = sle.file_storage_volume_id
          WHERE sle.barcode = ?1",
     )?;
-    let rows = stmt.query_map(params![barcode], |row| {
-        Ok(LogEntryLocation {
-            relative_path: row.get(0)?,
-            chunk_start_byte: row.get::<_, i64>(1)? as u64,
-            chunk_end_byte: row.get::<_, i64>(2)? as u64,
-            volume_path: row.get(3)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![barcode], location_from_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(ArchiveError::from)
 }
 
@@ -243,23 +284,16 @@ pub fn find_entries_by_barcode(conn: &Connection, barcode: &str) -> Result<Vec<L
 pub fn find_entries_by_filename_like(conn: &Connection, needle: &str) -> Result<Vec<LogEntryLocation>> {
     let pattern = format!("%{needle}%");
     let mut stmt = conn.prepare(
-        "SELECT sle.relative_path, sle.chunk_start_byte, sle.chunk_end_byte, fsv.path
+        "SELECT sle.relative_path, fsv.path, sle.content_hash, sle.commit_seq
          FROM scanned_log_entry sle
          JOIN file_storage_volume fsv ON fsv.id = sle.file_storage_volume_id
          WHERE sle.relative_path LIKE ?1",
     )?;
-    let rows = stmt.query_map(params![pattern], |row| {
-        Ok(LogEntryLocation {
-            relative_path: row.get(0)?,
-            chunk_start_byte: row.get::<_, i64>(1)? as u64,
-            chunk_end_byte: row.get::<_, i64>(2)? as u64,
-            volume_path: row.get(3)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![pattern], location_from_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(ArchiveError::from)
 }
 
-/// Saves a completed volume and all its entries inside a single database transaction.
+/// Saves a committed volume and all its entries inside a single database transaction.
 pub fn record_finished_volume(
     conn: &mut Connection,
     scan_session_id: i64,
@@ -271,13 +305,13 @@ pub fn record_finished_volume(
 ) -> Result<i64> {
     let tx = conn.transaction()?;
 
+    // Provisional upsert so entry rows have a volume id; the entry count is
+    // corrected below from the actual rows (the inserts are idempotent).
     let prior_count = match find_volume_by_name(&tx, volume_name)? {
         Some(id) => existing_entry_count(&tx, id)?,
         None => 0,
     };
-    let cumulative = prior_count + finished.entry_count as i64;
-
-    let volume_id = upsert_volume(&tx, volume_name, finished, cumulative, now)?;
+    let volume_id = upsert_volume(&tx, volume_name, finished, prior_count, now)?;
 
     for entry in &finished.written_entries {
         let Some(barcode) = barcode_of(&entry.relative_path) else {
@@ -291,23 +325,24 @@ pub fn record_finished_volume(
                 barcode: &barcode,
                 relative_path: &entry.relative_path,
                 source_subfolder: &subfolder,
-                chunk_start_byte: entry.chunk_start_byte,
-                chunk_end_byte: entry.chunk_end_byte,
+                content_hash: &entry.content_hash,
+                commit_seq: entry.commit_seq,
                 original_size: entry.original_size,
                 file_storage_volume_id: volume_id,
             },
         )?;
     }
 
+    let total: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM scanned_log_entry WHERE file_storage_volume_id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE file_storage_volume SET entry_count = ?1 WHERE id = ?2",
+        params![total, volume_id],
+    )?;
+
     tx.commit()?;
     Ok(volume_id)
-}
-
-/// Helper function (mainly for unit tests) to verify byte offsets match stored records.
-pub fn spans_match(spans: &[ChunkSpan], entries: &[LogEntryLocation]) -> bool {
-    entries.iter().all(|e| {
-        spans
-            .iter()
-            .any(|s| s.chunk_start_byte == e.chunk_start_byte && s.chunk_end_byte == e.chunk_end_byte)
-    })
 }
