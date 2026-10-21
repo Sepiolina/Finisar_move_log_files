@@ -125,7 +125,8 @@ fn write_entry_to(vol: &OpenVolume, relative_path: &str, dest_path: &Path) -> Re
 }
 
 /// A simple record of a file's path and size when browsing the full volume.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VolumeEntry {
     pub relative_path: String,
     pub size: u64,
@@ -167,7 +168,8 @@ pub fn extract_entry_from_volume(
 }
 
 /// Keeps track of a file's original name, where it was saved, and how many bytes were written.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtractedFile {
     pub relative_path: String,
     pub dest_path: PathBuf,

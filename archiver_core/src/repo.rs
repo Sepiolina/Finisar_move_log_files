@@ -249,7 +249,8 @@ pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64
 }
 
 /// Where an indexed file lives (used for extraction and search panels).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogEntryLocation {
     pub relative_path: String,
     pub volume_path: String,

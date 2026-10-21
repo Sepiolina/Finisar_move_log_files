@@ -175,7 +175,8 @@ pub struct SessionConfig {
 }
 
 /// Summary statistics for a completed archiving session.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionResult {
     pub scan_session_id: i64,
     pub barcodes_matched: usize,
@@ -191,7 +192,8 @@ pub struct SessionResult {
 }
 
 /// Statistics for a specific monthly volume. (For reporting only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VolumeBreakdown {
     pub volume_name: String,
     pub files_archived: usize,

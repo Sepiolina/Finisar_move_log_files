@@ -19,6 +19,33 @@ database for fast later retrieval.
 
 ---
 
+## Desktop UI (`ui/`, Tauri 2)
+
+A [Tauri](https://tauri.app) app: Rust commands on the back, a plain
+HTML/CSS/JS page on the front (no npm, no bundler). Every action draws
+a live **execution-flow diagram** so the operator sees exactly which
+step is running, what it is doing and how far along it is.
+
+```mermaid
+flowchart LR
+  A[Open index] --> B[Query SQL Server] --> C[Scan folders] --> D[Stage files]
+  D --> E[Commit to MOCHI] --> F[Clean staging] --> G[Report / email]
+```
+
+| File | Role |
+|---|---|
+| `ui/src/main.rs` | App setup, registers commands |
+| `ui/src/commands.rs` | `#[tauri::command]`s: settings, search, extract, volume viewer |
+| `ui/src/pipeline.rs` | The archive / dry run; emits `progress` events `{ step, message, done, total }` |
+| `ui/src/settings.rs` | Persisted `settings.json` |
+| `ui/frontend/` | `index.html`, `styles.css`, `app.js` — tabs, flow diagram, activity log |
+
+Build: `cargo build -p ui --release` (on Windows the WebView2 runtime is
+required; it ships with Windows 10/11). On Linux, install
+`libwebkit2gtk-4.1-dev` first.
+
+---
+
 ## 1. High-Level Flow
 
 ```mermaid
@@ -522,7 +549,7 @@ encrypted at rest with **AES-256-GCM**:
 
 ## 10. Post-Session Email Report — `email_report.rs`
 
-After a session finishes, the caller (the UI's worker thread) can
+After a session finishes, the caller (the UI's `pipeline.rs`) can
 build a `SessionStats` struct and POST a compact HTML summary to an
 internal, unauthenticated relay:
 
