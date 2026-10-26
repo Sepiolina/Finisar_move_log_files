@@ -4,7 +4,7 @@
 //! file count as well as bytes.
 
 use archiver_core::db::ArchivalCandidate;
-use archiver_core::mochi_store::{self, StoreFile, StoreOptions, STREAM_THRESHOLD};
+use archiver_core::mochi_store::{self, StoreFile, StoreOptions};
 use archiver_core::reader;
 use archiver_core::repo;
 use archiver_core::schema::open_and_migrate;
@@ -143,11 +143,12 @@ fn append_is_verified_against_the_previously_verified_head() {
 }
 
 #[test]
-fn commits_are_bounded_by_file_count_and_big_files_are_streamed() {
+fn commits_are_bounded_by_file_count_and_a_multi_chunk_file_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("2024/2024-06.mochi");
     let mut files: Vec<(String, Vec<u8>)> = (0..10).map(|i| (format!("BURNIN/f{i}.log"), format!("small {i}").into_bytes())).collect();
-    let big: Vec<u8> = (0..STREAM_THRESHOLD as usize + 12_345).map(|i| (i % 251) as u8).collect();
+    // Three MOCHI chunks (8 MiB each): compressed on MOCHI's worker threads.
+    let big: Vec<u8> = (0..20 * 1024 * 1024 + 12_345).map(|i| (i % 251) as u8).collect();
     files.push(("Xray/big.bin".into(), big.clone()));
     let refs: Vec<(&str, Vec<u8>)> = files.iter().map(|(p, d)| (p.as_str(), d.clone())).collect();
     let store = staged(&tmp.path().join("s"), &refs);

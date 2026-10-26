@@ -11,10 +11,12 @@
 //!   existing one is opened for append with `TailRepair::Refuse`, so an
 //!   interrupted earlier write surfaces as `UNCOMMITTED_TAIL` and is never
 //!   truncated automatically.
-//! * Files of [`STREAM_THRESHOLD`] or more are streamed into the writer
-//!   (`Transaction::put_file_from`, MOCHI 0.9.9+), so a big file is never held
-//!   in memory; smaller files are read into memory by worker threads before
-//!   the commit. A month is split into commits of at most
+//! * Every file is streamed into the writer (`Transaction::put_file_from`),
+//!   so no file is held in memory whole. MOCHI 0.9.11 reads, hashes and
+//!   compresses the content on worker threads ahead of the writer
+//!   (`WriterOptions::threads`, set from [`StoreOptions::workers`]) and
+//!   streams small files as cheaply as in-memory ones (0.9.10 zero-filled a
+//!   chunk-sized buffer per file). A month is split into commits of at most
 //!   [`COMMIT_BYTE_BUDGET`] bytes and [`COMMIT_FILE_BUDGET`] files; fewer,
 //!   larger commits matter with hundreds of thousands of small files, because
 //!   every commit is synced and adds catalog records.
@@ -62,17 +64,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Upper bound on the file bytes in one commit (128 MiB). Files below
-/// [`STREAM_THRESHOLD`] are read into memory (in parallel) before the commit,
-/// so this also bounds the memory a commit holds; it bounds the work a crash
-/// throws away too. A larger file is streamed and may exceed it alone.
-pub const COMMIT_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
-
-/// Files of at least this size are streamed into the writer
-/// (`put_file_from`) instead of read into memory. Streaming costs a fixed
-/// amount per file in MOCHI 0.9.10 (it prepares a whole chunk-sized buffer),
-/// which dominates for small log files, so those are read up front.
-pub const STREAM_THRESHOLD: u64 = 4 * 1024 * 1024;
+/// Upper bound on the file bytes in one commit (1 GiB). Content is streamed,
+/// so this does not bound memory; it bounds the work a crash throws away. A
+/// larger file is committed alone.
+pub const COMMIT_BYTE_BUDGET: u64 = 1024 * 1024 * 1024;
 
 /// Upper bound on the files in one commit. Small log files are the norm, so
 /// without this a month of 300,000 files would be a single commit.
@@ -91,7 +86,7 @@ pub const ARCHIVE_EXTENSION: &str = "mochi";
 pub struct StoreOptions {
     pub byte_budget: u64,
     pub file_budget: usize,
-    /// Threads that read small files before each commit (`0`: automatic).
+    /// Threads MOCHI may use to read, hash and compress (`0`: automatic).
     pub workers: usize,
 }
 
@@ -223,7 +218,6 @@ struct Batcher<'a> {
     next: usize,
     byte_budget: u64,
     file_budget: usize,
-    workers: usize,
     /// The head namespace when the writer was opened (`None` while the
     /// archive does not exist). This call is the only writer (MOCHI's lock),
     /// so the head later is this plus what this call put.
@@ -239,7 +233,6 @@ impl<'a> Batcher<'a> {
             next: 0,
             byte_budget: opts.byte_budget,
             file_budget: opts.file_budget.max(1),
-            workers: par::worker_count(opts.workers),
             head: None,
             dirs_done: HashSet::new(),
         }
@@ -328,36 +321,14 @@ impl<'a> Batcher<'a> {
             self.next += 1;
         }
 
-        // Small files are read into memory in parallel; big ones streamed.
-        let contents = par::map(
-            &chosen,
-            self.workers,
-            |(_, file, meta)| -> Result<Option<Vec<u8>>> {
-                if meta.len() >= STREAM_THRESHOLD {
-                    return Ok(None);
-                }
-                fs::read(&file.staged_path)
-                    .map(Some)
-                    .map_err(|e| ArchiveError::io(&file.staged_path, e))
-            },
-            |_| {},
-        );
-        for ((i, file, meta), content) in chosen.into_iter().zip(contents) {
+        for (i, file, meta) in chosen {
             let attributes = Attributes {
                 mtime: mtime_of(&meta),
                 ..Attributes::default()
             };
-            let path = entries[i].path.clone();
-            match content? {
-                Some(bytes) => {
-                    tx.put_file(path, bytes, attributes);
-                }
-                None => {
-                    let source: Arc<dyn FileSource> =
-                        Arc::new(OsFile::new(file.staged_path.clone(), meta.len()));
-                    tx.put_file_from(path, source, attributes);
-                }
-            }
+            let source: Arc<dyn FileSource> =
+                Arc::new(OsFile::new(file.staged_path.clone(), meta.len()));
+            tx.put_file_from(entries[i].path.clone(), source, attributes);
         }
         if entries.is_empty() {
             Ok(None)
@@ -410,8 +381,12 @@ pub fn store_volume_with(archive_path: &Path, files: &[StoreFile], store: &Store
         progress: &progress,
         cancel: &cancel,
     };
+    // MOCHI 0.9.11 compresses on worker threads; give it this month's share
+    // of the workers (several months may be written at once).
+    let threads = par::worker_count(store.workers);
     let opts = || WriterOptions {
         record_time: true,
+        threads: Some(threads),
         ..WriterOptions::default()
     };
     let mut dir = OsDir::containing(archive_path).map_err(|e| map(MochiError::from(e)))?;

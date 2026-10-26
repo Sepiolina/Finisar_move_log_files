@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "733a21bd2a841fe7ab198137fa89b3439fe20ac1" }
+mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "daaae1c0c45f6c916617a33ebb869e0c405a8bcb" }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 thiserror = "1.0"
 rusqlite = { version = "0.40", features = ["bundled"] }

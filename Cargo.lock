@@ -2419,8 +2419,8 @@ dependencies = [
 
 [[package]]
 name = "mochi-core"
-version = "0.9.10"
-source = "git+https://github.com/immerh8/MOCHI?rev=733a21bd2a841fe7ab198137fa89b3439fe20ac1#733a21bd2a841fe7ab198137fa89b3439fe20ac1"
+version = "0.9.11"
+source = "git+https://github.com/immerh8/MOCHI?rev=daaae1c0c45f6c916617a33ebb869e0c405a8bcb#daaae1c0c45f6c916617a33ebb869e0c405a8bcb"
 dependencies = [
  "getrandom 0.3.4",
  "mochi-format",
@@ -2432,8 +2432,8 @@ dependencies = [
 
 [[package]]
 name = "mochi-format"
-version = "0.9.10"
-source = "git+https://github.com/immerh8/MOCHI?rev=733a21bd2a841fe7ab198137fa89b3439fe20ac1#733a21bd2a841fe7ab198137fa89b3439fe20ac1"
+version = "0.9.11"
+source = "git+https://github.com/immerh8/MOCHI?rev=daaae1c0c45f6c916617a33ebb869e0c405a8bcb#daaae1c0c45f6c916617a33ebb869e0c405a8bcb"
 dependencies = [
  "argon2",
  "blake3",
@@ -2446,8 +2446,8 @@ dependencies = [
 
 [[package]]
 name = "mochi-sys"
-version = "0.9.10"
-source = "git+https://github.com/immerh8/MOCHI?rev=733a21bd2a841fe7ab198137fa89b3439fe20ac1#733a21bd2a841fe7ab198137fa89b3439fe20ac1"
+version = "0.9.11"
+source = "git+https://github.com/immerh8/MOCHI?rev=daaae1c0c45f6c916617a33ebb869e0c405a8bcb#daaae1c0c45f6c916617a33ebb869e0c405a8bcb"
 dependencies = [
  "windows-sys 0.61.2",
 ]

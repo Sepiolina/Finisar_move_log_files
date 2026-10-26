@@ -157,19 +157,21 @@ changed:
    chunking (we do **not** compress anything ourselves, so there is no
    compression-level setting any more).
 2. **Bounded commits.** The month's staged files are split into commits of
-   at most `COMMIT_BYTE_BUDGET` (**128 MiB**) and `COMMIT_FILE_BUDGET`
+   at most `COMMIT_BYTE_BUDGET` (**1 GiB**) and `COMMIT_FILE_BUDGET`
    (**20,000 files**). Each commit is one `LOCAL_COMMITTED` snapshot; a
    crash loses at most the commit in progress (the next run skips what
    was already committed, see *Idempotency*).
-   **Content:** files of `STREAM_THRESHOLD` (**4 MiB**) or more are
-   streamed into the writer with `Transaction::put_file_from` (MOCHI
-   0.9.9+), one chunk at a time, so a big file is never held in memory.
-   Smaller files are read into memory by worker threads before the commit
-   (bounded by the byte budget): in MOCHI 0.9.10 streaming costs a fixed
-   amount per file, which made it about 4x slower for small logs.
-   **Peak memory:** about the byte budget per month being written (two
-   months are written at once on a 4+ core machine), plus MOCHI's chunk
-   buffers.
+   **Content:** every file is streamed into the writer with
+   `Transaction::put_file_from`, one chunk at a time, so no file is held in
+   memory whole. MOCHI 0.9.11 reads, hashes and compresses the content on
+   worker threads ahead of the writer (`WriterOptions::threads`, set to the
+   archiver's per-month worker count so two months written at once do not
+   oversubscribe the CPU); the archive is the same bytes for any thread
+   count. 0.9.11 also streams small files as cheaply as in-memory ones
+   (0.9.10 zero-filled an 8 MiB buffer per file, which is why the archiver
+   used to read small files into memory itself).
+   **Peak memory:** MOCHI's in-flight chunks, about `2 × threads` pieces of
+   at most 8 MiB plus their frames per month being written.
    **Linear cost:** the head namespace is replayed once per call, not once
    per commit, and the content hashes MOCHI computed while writing are
    read from the catalog afterwards (no separate hashing pass).
@@ -679,7 +681,7 @@ local SSD:
 |---|---|---|
 | 20,000 files, 1 month | 1,056 s (19 files/s) | **9.4 s** (2,100 files/s) |
 | 100,000 files, 1 month | (quadratic, not run) | **65 s** |
-| 300,000 files, 3 months | (quadratic, not run) | **163 s** (1,840 files/s) |
+| 300,000 files, 3 months | (quadratic, not run) | **158 s** (1,900 files/s) |
 | append 2,000 files to a 100,000-file month | — | **11 s** |
 
 Where the time went before: every verification read used
@@ -693,7 +695,7 @@ What changed:
 | Scan | subfolders listed in parallel; entry type from the listing (no `stat` per file); only matches are `stat`ed |
 | Candidate check | one read transaction and cached statements for 300k lookups |
 | Stage | manifest synced per 2,000 lines, renames in parallel, directories created once |
-| Commit | bounded by files and bytes; small files read in parallel, big ones streamed; one namespace replay per month; hashes taken from MOCHI's catalog |
+| Commit | bounded by files and bytes; every file streamed, MOCHI compresses on worker threads (0.9.11); one namespace replay per month; hashes taken from MOCHI's catalog |
 | Verify | per-file checks on worker threads with `read_version`; structural check only of the new commits when the previous head is known |
 | Months | written and verified concurrently (separate archives, separate locks) |
 | Index | cached statements for the per-row inserts |
