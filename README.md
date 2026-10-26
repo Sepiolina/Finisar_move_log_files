@@ -120,7 +120,7 @@ all).
 ## 3. The Archive Format — `mochi_store.rs` / `reader.rs`
 
 Storage is delegated to **MOCHI** (`mochi-core`, pinned to commit
-`733a21bd2a841fe7ab198137fa89b3439fe20ac1`, 0.9.6). A `.mochi` file is
+`e7902607653c65f558f5b4ab16ce65961734139a`, 0.9.11). A `.mochi` file is
 an append-only chain of **commits**; every commit is a full snapshot of
 a namespace of files and directories, hash-anchored with BLAKE3. The
 program keeps the same *what/how* as before — only the container
@@ -631,7 +631,7 @@ used as the return type throughout the crate.
 
 | Crate | Purpose |
 |---|---|
-| `mochi-core` (git, pinned rev `733a21b`, 0.9.10) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
+| `mochi-core` (git, pinned rev `e790260`, 0.9.11) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
 | `blake3` | BLAKE3 of staged files (same hash MOCHI records as the content hash) |
 | `rusqlite` 0.40 (bundled) | SQLite index (must match `mochi-core`'s version: both link `sqlite3`) |
 | `aho-corasick` | multi-pattern barcode matching in filenames |
