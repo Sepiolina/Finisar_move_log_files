@@ -35,6 +35,7 @@ fn config(source_dir: PathBuf, output_dir: PathBuf, staging_dir: PathBuf) -> Ses
         allowed_extensions: vec!["txt".into(), "zip".into()],
         lookback_days: 2,
         date_range_override: None,
+        workers: 2,
     }
 }
 

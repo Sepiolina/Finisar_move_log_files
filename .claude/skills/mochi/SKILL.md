@@ -208,7 +208,7 @@ The crates are not published to crates.io. Depend on git or a path:
 
 ```toml
 [dependencies]
-mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "b17f600" }  # 0.9.6
+mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "733a21b" }  # 0.9.10
 ```
 
 The workspace pins Rust 1.91 (minimum 1.89). SQLite is bundled through

@@ -8,8 +8,11 @@ monthly [MOCHI](https://github.com/immerh8/MOCHI) archives
 file's archive path, content hash and commit in a local SQLite
 database for fast later retrieval.
 
-- **64 automated tests** in `archiver_core` (`src/` inline tests +
+- **69 automated tests** in `archiver_core` (`src/` inline tests +
   `tests/*.rs` integration tests), plus 2 in the `ui` crate.
+- Built for **200,000–300,000+ small files per run**: work is spread over
+  worker threads and every step is linear in the file count (see
+  [§14 Performance at scale](#14-performance-at-scale)).
 - Crash-safe by design: a process kill at any point during a run
   leaves either fully-committed data or fully-recoverable staged
   data — never a file that exists nowhere.
@@ -65,11 +68,11 @@ flowchart TD
     K --> L[Append manifest.jsonl entry<br/>after each successful rename]
     L --> M[Group staged files by<br/>target volume  YYYY-MM]
     M --> N[For each volume: create or append<br/>YYYY-MM.mochi, TailRepair::Refuse]
-    N --> O[Commit files in byte-bounded batches<br/>64 MiB per commit, then close writer]
-    O --> P[Reopen archive read-only:<br/>head hash == BLAKE3 of staged file<br/>+ verified read-back + Content verify]
+    N --> O[Commit files in bounded batches<br/>128 MiB / 20,000 files per commit, then close writer]
+    O --> P[Reopen archive read-only:<br/>head hash == BLAKE3 of staged file<br/>+ verified read-back + new-commit or whole-archive verify]
     P --> R{Every entry present<br/>and hashes equal?}
-    R -- no --> S[Abort — leave staging intact<br/>for next run to resume]
-    R -- yes --> T[Upsert file_storage_volume head<br/>insert scanned_log_entry rows]
+    R -- no --> S[Keep this month's staging<br/>for next run to resume]
+    R -- yes --> T[Upsert file_storage_volume head<br/>insert scanned_log_entry rows<br/>delete this month's staged copies]
     T --> U{More volumes<br/>to process?}
     U -- yes --> N
     U -- no --> V[Remove /staging entirely]
@@ -95,6 +98,7 @@ before doing anything else.
 | Module | Responsibility |
 |---|---|
 | `mochi_store.rs` | Monthly MOCHI archive writer: create-or-append, byte-bounded commits, hashing, read-only verification |
+| `par.rs` | Small std-only scoped worker pool (ordered results, progress ticks on the calling thread) |
 | `reader.rs` | Reads `.mochi` volumes back out (via `mochi-core`) — extraction, listing, preview, safe path joining |
 | `schema.rs` | SQLite schema (4 tables, `user_version` 2) for the index |
 | `repo.rs` | Typed CRUD over the SQLite index |
@@ -116,7 +120,7 @@ all).
 ## 3. The Archive Format — `mochi_store.rs` / `reader.rs`
 
 Storage is delegated to **MOCHI** (`mochi-core`, pinned to commit
-`b17f600411742f1a1174abce6588be9e88974402`, 0.9.6). A `.mochi` file is
+`733a21bd2a841fe7ab198137fa89b3439fe20ac1`, 0.9.6). A `.mochi` file is
 an append-only chain of **commits**; every commit is a full snapshot of
 a namespace of files and directories, hash-anchored with BLAKE3. The
 program keeps the same *what/how* as before — only the container
@@ -152,17 +156,23 @@ changed:
    default profile: in-archive deduplication on, MOCHI's own Zstandard
    chunking (we do **not** compress anything ourselves, so there is no
    compression-level setting any more).
-2. **Bounded commits.** MOCHI holds a commit's content in memory, so the
-   month's staged files are split into several commits whose file bytes
-   stay within `COMMIT_BYTE_BUDGET` (**64 MiB**). A file larger than the
-   budget gets a commit of its own. Each commit is one
-   `LOCAL_COMMITTED` snapshot; small months are a single commit.
-   **Peak memory:** MOCHI keeps a commit's file bytes in memory while it
-   encodes and writes them, so expect roughly the budget (64 MiB) times a
-   small factor for MOCHI's working copies (chunk buffers, encoded frames),
-   i.e. a few hundred MiB at most for normal files. A single file larger
-   than the budget is committed alone and needs that whole file (times the
-   same factor) in memory, so the largest staged file bounds peak RAM.
+2. **Bounded commits.** The month's staged files are split into commits of
+   at most `COMMIT_BYTE_BUDGET` (**128 MiB**) and `COMMIT_FILE_BUDGET`
+   (**20,000 files**). Each commit is one `LOCAL_COMMITTED` snapshot; a
+   crash loses at most the commit in progress (the next run skips what
+   was already committed, see *Idempotency*).
+   **Content:** files of `STREAM_THRESHOLD` (**4 MiB**) or more are
+   streamed into the writer with `Transaction::put_file_from` (MOCHI
+   0.9.9+), one chunk at a time, so a big file is never held in memory.
+   Smaller files are read into memory by worker threads before the commit
+   (bounded by the byte budget): in MOCHI 0.9.10 streaming costs a fixed
+   amount per file, which made it about 4x slower for small logs.
+   **Peak memory:** about the byte budget per month being written (two
+   months are written at once on a 4+ core machine), plus MOCHI's chunk
+   buffers.
+   **Linear cost:** the head namespace is replayed once per call, not once
+   per commit, and the content hashes MOCHI computed while writing are
+   read from the catalog afterwards (no separate hashing pass).
 3. The writer is closed with `close()` to release the archive's
    single-writer lock; the head `commit_id` and `seq` are returned.
 
@@ -178,7 +188,7 @@ person has to run `mochi verify` and then `mochi append --truncate-tail`
 
 Idempotency: before a file is put, the head is checked; if the path is
 already there with an identical BLAKE3 hash the file is **not written
-again** (no duplicate version, nothing read into memory). It is still
+again** (no duplicate version). It is still
 returned in `written_entries` (so it is verified and indexed; its
 `commit_seq` is the head sequence at that moment, i.e. "added at or before
 this commit"). A batch made only of such files makes no new commit. This
@@ -195,22 +205,36 @@ never shown as success-styled "safe".
 
 ### Verification (replaces "decompress a chunk and count")
 
-After the commit, `mochi_store::verify_volume` reopens the archive
-**read-only** (`OsReadStorage` + `open_head`) and, for every staged
-entry, requires:
+After the commit, `mochi_store::verify_volume_with` reopens the archive
+**read-only** (`OsReadStorage` + `open_head`, one independent handle per
+worker thread) and, for every staged entry, requires:
 
 1. the path is present in the head as a file;
 2. the head's BLAKE3 content hash equals the BLAKE3 of the staged file
    on disk (hashed again at this point, streaming);
-3. a full `read::read_file` of the stored copy succeeds and its bytes
-   hash to the same value (end-to-end verified read);
+3. a full verified read of the stored copy (`read::read_version`, from a
+   namespace replayed once per worker: `read::read_file` replays the
+   whole namespace on every call, which is quadratic for 100k+ files)
+   succeeds and its bytes hash to the same value;
 
-and finally runs `verify::verify` at the **ContentIntegrity** level over
-the whole archive; any failed dimension, operational error or report exit
-code 1 aborts (exit code 2 is the normal "degraded" result in 1.0).
-The cost of the last step grows with the month's archive size (it reads
-every chunk once per session). Any failure leaves `/staging` and the
-manifest untouched.
+then the archive structure:
+
+- **Append to a known head** (the head the index recorded after the
+  previous verified write equals the archive's head before this run's
+  commits): `verify::verify_commits_since` (MOCHI 0.9.8+) — the chain
+  link to that head, plus every data object the new commits introduce,
+  located, hash-checked and decoded. Older commits were verified when
+  they were written.
+- **Otherwise** (new archive, index lost, archive changed outside this
+  program, a resume after a crash between commit and index):
+  `verify::verify` at the **ContentIntegrity** level over the whole
+  archive; any failed dimension, operational error or report exit code 1
+  aborts (exit code 2 is the normal "degraded" result in 1.0).
+
+Any failure leaves that month's staged files and the manifest untouched.
+Because the daily check covers only what is new, run `mochi verify` over
+the output folder now and then (for example weekly) to re-check old
+months against bit rot.
 
 ### Reading — the extraction path
 
@@ -377,34 +401,40 @@ together. Its steps, in order:
    (`matched` or `no_files_found`), batched inside a single
    transaction (avoids one disk sync per row at scale — relevant at
    ~200k+ candidates per run).
-7. **Stage.** Entries are written to `manifest.jsonl` and **flushed
-   before** the files they describe are renamed, in batches of 500; then
-   each file is `fs::rename`d from the source tree into
-   `/staging/<subfolder>/<filename>` (see §7). A renamed file can therefore
-   never be missing from the manifest; a listed file that was not renamed
-   yet is simply still in the source tree.
+7. **Stage.** Entries are written to `manifest.jsonl` and **synced
+   (`fsync`) before** the files they describe are renamed, in batches of
+   2,000; then the files are `fs::rename`d in parallel from the source tree
+   into `/staging/<subfolder>/<filename>` (see §7). A renamed file can
+   therefore never be missing from the manifest; a listed file that was
+   not renamed is simply still in the source tree. A rename that fails
+   (file locked by a tester, permissions) no longer aborts the run: the
+   file stays in the source, is counted in `errors`, and a later run picks
+   it up. A staging path that is already taken is **never overwritten**
+   (`fs::rename` would silently replace it on both Linux and Windows, and
+   that file may be the only copy).
 8. **Archive + verify + cleanup** — delegated to `finish_staged_batch`
    (shared with the resume path in step 1):
    - Group staged entries by target volume (`YYYY-MM`).
-   - For each volume: `mochi_store::store_volume` creates or appends
-     `<output_dir>/<YYYY>/<YYYY-MM>.mochi` in byte-bounded commits and
-     closes the writer.
-   - **Verify** the committed archive read-only
-     (`mochi_store::verify_volume`): every staged entry present in the
-     head with a BLAKE3 hash equal to the staged file's, a verified
-     read-back, and a `ContentIntegrity` `verify::verify` of the whole
-     archive. Any failure — including `LOCK_CONFLICT` or
-     `UNCOMMITTED_TAIL` when opening — aborts the session *without
-     deleting staging*; the next run finds the manifest and retries.
-   - Upsert `file_storage_volume` (head commit id/seq) and
-     `scanned_log_entry` rows (content hash, commit seq) for every
-     verified entry.
-   - Only after **every** touched volume passes verification is staging
-     cleaned up, and only selectively: the verified files **listed in the
-     manifest** are deleted, then `manifest.jsonl`, then directories that
-     are now empty. Anything else still in staging (e.g. a file renamed in
-     by a crashed run whose manifest line was lost) is **never deleted**:
-     it stays, is counted in `errors`, and a warning names it.
+   - Months are separate archives with separate writer locks, so up to
+     `workers / 2` of them are committed and verified at once on worker
+     threads. Workers never touch SQLite or delete anything.
+   - For each volume: `mochi_store::store_volume_with` creates or appends
+     `<output_dir>/<YYYY>/<YYYY-MM>.mochi` in bounded commits and closes
+     the writer.
+   - **Verify** the committed archive read-only (see §3 *Verification*).
+   - On the main thread: upsert `file_storage_volume` (head commit id/seq)
+     and `scanned_log_entry` rows (content hash, commit seq) for every
+     verified entry, **then** delete that month's verified staged files.
+   - A month that fails (including `LOCK_CONFLICT` or `UNCOMMITTED_TAIL`
+     when opening) keeps **all** of its staged files; the other months
+     carry on. The session then returns the error with the manifest kept,
+     and the next run resumes only what is still in staging (files of
+     months already done are gone from staging and skipped).
+   - When every month succeeded: `manifest.jsonl` is removed, then
+     directories that are now empty. Anything else still in staging (e.g.
+     a file renamed in by a crashed run whose manifest line was lost) is
+     **never deleted**: it stays, is counted in `errors`, and a warning
+     names it.
 9. **Complete the session row** (status `success`, final counters).
 
 ### Multi-volume-per-run handling
@@ -412,9 +442,9 @@ together. Its steps, in order:
 A single scan can match barcodes from different months (e.g. an
 August scan finding both July-dated and August-dated logs). Each
 month gets its own independently opened/verified `.mochi` archive —
-`finish_staged_batch` loops over a `BTreeMap<volume_name, entries>`
-and only deletes staging after the *entire* map has been processed
-successfully.
+`finish_staged_batch` groups a `BTreeMap<volume_name, entries>`, runs the
+months on worker threads, and deletes a month's staged copies only after
+that month is committed, verified and indexed.
 
 ---
 
@@ -466,9 +496,10 @@ Format: append-only, line-delimited JSON.
 - **Header line** (`scan_session_id`) is written once, before any
   file is staged.
 - **One line per file**, written and flushed *before* that file's
-  `fs::rename` into staging. Lines go out in batches of 500
-  (`StagingManifestWriter::FLUSH_EVERY`): the whole batch is flushed first,
-  then its files are renamed. Consequence: every file that exists in
+  `fs::rename` into staging. Lines go out in batches of 2,000
+  (`StagingManifestWriter::FLUSH_EVERY`): the whole batch is flushed and
+  synced to disk (`sync_data`) first, then its files are renamed, so even a
+  power cut cannot keep a rename whose line was lost. Consequence: every file that exists in
   staging is listed. The reverse can be false after a crash (listed, but
   not yet renamed): on resume such a file is skipped as absent from
   staging, and it is still in the source tree, so nothing is lost.
@@ -598,7 +629,7 @@ used as the return type throughout the crate.
 
 | Crate | Purpose |
 |---|---|
-| `mochi-core` (git, pinned rev `b17f600`) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
+| `mochi-core` (git, pinned rev `733a21b`, 0.9.10) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
 | `blake3` | BLAKE3 of staged files (same hash MOCHI records as the content hash) |
 | `rusqlite` 0.40 (bundled) | SQLite index (must match `mochi-core`'s version: both link `sqlite3`) |
 | `aho-corasick` | multi-pattern barcode matching in filenames |
@@ -623,7 +654,9 @@ used as the return type throughout the crate.
 | `tests/secure_config.rs` | Round-trip, tamper detection, wrong-key rejection | 8 |
 | `src/email_report.rs` (inline) | Size-budget shrinking, escaping | 3 |
 | `src/session.rs` (inline) | Manifest round trip, truncated-line tolerance, orphaned-session-id recovery | 3 |
-| **Total (`archiver_core`)** | | **64** |
+| `tests/large_batch_integrity.rs` | Staging never overwrites, a failing month keeps its files and does not block the others (then resumes), append verified against the previous head (wrong anchor and changed file fail), file-count commit bound + streamed big file | 4 |
+| `src/par.rs` (inline) | Worker pool order and progress | 1 |
+| **Total (`archiver_core`)** | | **69** |
 
 `ui` has 2 further settings tests.
 
@@ -631,3 +664,46 @@ used as the return type throughout the crate.
 > is compile-verified only — no reachable SQL Server instance exists
 > in the build/test sandbox. The query builder and resume-window math
 > around it are unit tested independently of an actual connection.
+
+---
+
+## 14. Performance at scale
+
+Measured with `cargo run --release -p archiver_core --example bench_session
+-- <files> <months> <dir> [append]` (about 2 KiB per file, five
+subfolders, a full session from scan to cleanup, then a check that every
+file is indexed and nothing is left in source or staging). 4-core Linux VM,
+local SSD:
+
+| Run | Before (mochi-core 0.9.6 code) | Now |
+|---|---|---|
+| 20,000 files, 1 month | 1,056 s (19 files/s) | **9.4 s** (2,100 files/s) |
+| 100,000 files, 1 month | (quadratic, not run) | **65 s** |
+| 300,000 files, 3 months | (quadratic, not run) | **163 s** (1,840 files/s) |
+| append 2,000 files to a 100,000-file month | — | **11 s** |
+
+Where the time went before: every verification read used
+`read::read_file`, which replays the whole namespace per call, and every
+commit replayed the head again, so a month of N files cost O(N²).
+
+What changed:
+
+| Step | How |
+|---|---|
+| Scan | subfolders listed in parallel; entry type from the listing (no `stat` per file); only matches are `stat`ed |
+| Candidate check | one read transaction and cached statements for 300k lookups |
+| Stage | manifest synced per 2,000 lines, renames in parallel, directories created once |
+| Commit | bounded by files and bytes; small files read in parallel, big ones streamed; one namespace replay per month; hashes taken from MOCHI's catalog |
+| Verify | per-file checks on worker threads with `read_version`; structural check only of the new commits when the previous head is known |
+| Months | written and verified concurrently (separate archives, separate locks) |
+| Index | cached statements for the per-row inserts |
+| Cleanup | per month, right after it is indexed, in parallel |
+
+`SessionConfig::workers` sets the thread count (`0`: the CPU count, at
+most 8). On a network share more threads mainly help the rename and
+delete steps; on a slow single disk, fewer may be better.
+
+Remaining fixed costs come from MOCHI itself: opening the head of a
+100,000-file archive takes about 2.5 s (once for the writer, once per
+verification worker, once for the scoped check), and a commit costs about
+0.25 ms per small file.

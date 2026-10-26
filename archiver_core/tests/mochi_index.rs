@@ -17,6 +17,7 @@ fn finished(path: &str, size: u64, head: &str, seq: u64, entries: Vec<StoredEntr
         commit_seqs: vec![seq],
         created: false,
         degraded_durability: None,
+        prior_head: None,
     }
 }
 

@@ -17,6 +17,7 @@ use crate::mochi_store::{self, StoreFile};
 use crate::repo::{self, BarcodeStatus, SessionStatus};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -112,7 +113,7 @@ pub struct StagingManifestWriter {
 
 impl StagingManifestWriter {
     /// How many files to stage before forcing a save to the disk.
-    pub const FLUSH_EVERY: usize = 500;
+    pub const FLUSH_EVERY: usize = 2000;
 
     /// Creates the manifest file and writes the initial session header.
     pub fn create(staging_dir: &Path, scan_session_id: i64) -> Result<Self> {
@@ -144,11 +145,16 @@ impl StagingManifestWriter {
         writeln!(self.file, "{json}").map_err(|e| ArchiveError::io("manifest.jsonl", e))
     }
 
-    /// Forces unsaved lines to be written to disk.
+    /// Forces unsaved lines to be written to disk and synced (`fsync`), so a
+    /// power cut cannot keep a rename while losing the line that lists it.
     pub fn flush(&mut self) -> Result<()> {
         use std::io::Write as _;
         self.file
             .flush()
+            .map_err(|e| ArchiveError::io("manifest.jsonl", e))?;
+        self.file
+            .get_ref()
+            .sync_data()
             .map_err(|e| ArchiveError::io("manifest.jsonl", e))?;
         self.pending_since_flush = 0;
         Ok(())
@@ -172,6 +178,9 @@ pub struct SessionConfig {
     /// Manual override to scan a specific date range (e.g., historical backfill) 
     /// instead of automatically calculating from the last run.
     pub date_range_override: Option<(String, String)>,
+    /// Worker threads for scanning, staging, verification and cleanup
+    /// (`0`: automatic, the CPU count capped at 8).
+    pub workers: usize,
 }
 
 /// Summary statistics for a completed archiving session.
@@ -213,6 +222,100 @@ fn volume_name_from_date(date: &str) -> Result<String> {
         )));
     }
     Ok(date[0..7].to_string())
+}
+
+/// What scanning one subfolder found.
+struct ScanOutcome {
+    entries: Vec<StagedManifestEntry>,
+    errors: i64,
+    warning: Option<String>,
+}
+
+/// Lists one configured subfolder (not recursive) and keeps the files whose
+/// name matches exactly one candidate barcode. Only matches are `stat`ed:
+/// the entry type comes from the directory listing itself, and symlinks are
+/// not followed (moving a link would not move the log it points to).
+fn scan_subfolder(
+    config: &SessionConfig,
+    subfolder: &str,
+    matcher: &BarcodeMatcher,
+    candidate_date: &HashMap<&str, &str>,
+    scanned: &AtomicUsize,
+) -> ScanOutcome {
+    let mut out = ScanOutcome {
+        entries: Vec::new(),
+        errors: 0,
+        warning: None,
+    };
+    let subfolder_dir = config.source_dir.join(subfolder);
+    if !subfolder_dir.is_dir() {
+        out.errors += 1;
+        out.warning = Some(format!("Warning: configured subfolder '{subfolder}' not found — skipping."));
+        return out;
+    }
+    // Catch folder read errors safely so one bad folder doesn't crash the whole run.
+    let read_dir = match fs::read_dir(&subfolder_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            out.errors += 1;
+            out.warning = Some(format!("Warning: failed to read subfolder '{subfolder}': {e} — skipping."));
+            return out;
+        }
+    };
+
+    for entry in read_dir {
+        scanned.fetch_add(1, Ordering::Relaxed);
+        let Ok(entry) = entry else {
+            out.errors += 1;
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let filename = file_name.to_string_lossy();
+        if !has_matching_extension(&filename, &config.allowed_extensions) {
+            continue;
+        }
+
+        let matched_barcodes = matcher.matching_barcodes(&filename);
+        if matched_barcodes.len() > 1 {
+            out.errors += 1; // File matched multiple barcodes, which shouldn't happen
+            continue;
+        }
+        let Some(barcode) = matched_barcodes.into_iter().next() else {
+            continue;
+        };
+        let Some(date) = candidate_date.get(barcode.as_str()) else {
+            out.errors += 1;
+            continue;
+        };
+        let Ok(volume_name) = volume_name_from_date(date) else {
+            out.errors += 1;
+            continue;
+        };
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.entries.push(StagedManifestEntry {
+            relative_path: format!("{subfolder}/{filename}"),
+            source_subfolder: subfolder.to_string(),
+            barcode,
+            original_size: size,
+            volume_name,
+        });
+    }
+    out
+}
+
+/// Moves one listed file from the source tree into staging. Never replaces
+/// a file already in staging. The error is a message for the operator.
+fn stage_one(config: &SessionConfig, entry: &StagedManifestEntry) -> std::result::Result<(), String> {
+    let source_path = config.source_dir.join(&entry.relative_path);
+    let staged_path = config.staging_dir.join(&entry.relative_path);
+    if fs::symlink_metadata(&staged_path).is_ok() {
+        return Err(format!("{}: already in staging, not overwritten", entry.relative_path));
+    }
+    fs::rename(&source_path, &staged_path).map_err(|e| format!("{}: {e}", entry.relative_path))
 }
 
 /// Checks that a configured subfolder is a single plain path component: not
@@ -302,11 +405,14 @@ where
 
     let already_scanned: HashSet<&str> = {
         let mut set = HashSet::new();
+        // One read transaction for all lookups (hundreds of thousands).
+        let tx = conn.transaction()?;
         for c in &candidates {
-            if repo::is_barcode_already_scanned(conn, &c.barcode, &c.last_update)? {
+            if repo::is_barcode_already_scanned(&tx, &c.barcode, &c.last_update)? {
                 set.insert(c.barcode.as_str());
             }
         }
+        tx.commit()?;
         set
     };
     let fresh_candidates: Vec<&ArchivalCandidate> = candidates
@@ -314,93 +420,32 @@ where
         .filter(|c| !already_scanned.contains(c.barcode.as_str()))
         .collect();
 
-    let mut manifest_entries = Vec::new();
+    let workers = crate::par::worker_count(config.workers);
     let mut errors = 0i64;
-    let mut total_files_scanned = 0usize;
 
-    for subfolder in &config.subfolders {
-        let subfolder_dir = config.source_dir.join(subfolder);
-        if !subfolder_dir.is_dir() {
+    // Subfolders are scanned in parallel; `scanned` feeds the progress line.
+    if let Some(cb) = progress_callback {
+        cb(format!("Scanning {} subfolder(s)...", config.subfolders.len()), 0, 0);
+    }
+    let scanned = AtomicUsize::new(0);
+    let outcomes = crate::par::map(
+        &config.subfolders,
+        workers,
+        |subfolder| scan_subfolder(config, subfolder, &matcher, &candidate_date, &scanned),
+        |_| {
             if let Some(cb) = progress_callback {
-                cb(format!("Warning: configured subfolder '{subfolder}' not found — skipping."), 0, 0);
+                cb(format!("Scanned {} files so far...", scanned.load(Ordering::Relaxed)), 0, 0);
             }
-            errors += 1;
-            continue;
+        },
+    );
+    let total_files_scanned = scanned.load(Ordering::Relaxed);
+    let mut manifest_entries = Vec::new();
+    for outcome in outcomes {
+        errors += outcome.errors;
+        if let (Some(w), Some(cb)) = (outcome.warning, progress_callback) {
+            cb(w, 0, 0);
         }
-
-        if let Some(cb) = progress_callback {
-            cb(format!("Scanning subfolder: {}...", subfolder), 0, 0);
-        }
-
-        // Catch folder read errors safely so one bad folder doesn't crash the whole run.
-        let read_dir = match fs::read_dir(&subfolder_dir) {
-            Ok(rd) => rd,
-            Err(e) => {
-                if let Some(cb) = progress_callback {
-                    cb(format!("Warning: failed to read subfolder '{subfolder}': {e} — skipping."), 0, 0);
-                }
-                errors += 1;
-                continue;
-            }
-        };
-
-        for entry in read_dir {
-            total_files_scanned += 1;
-
-            // Log to UI periodically to show the app isn't frozen.
-            if total_files_scanned % 5000 == 0 {
-                if let Some(cb) = progress_callback {
-                    cb(format!("Scanned {} files so far (found {} matches)...", total_files_scanned, manifest_entries.len()), 0, 0);
-                }
-            }
-
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if !has_matching_extension(&filename, &config.allowed_extensions) {
-                continue;
-            }
-
-            let matched_barcodes = matcher.matching_barcodes(&filename);
-            if matched_barcodes.len() > 1 {
-                errors += 1; // File matched multiple barcodes, which shouldn't happen
-                continue;
-            }
-            let Some(barcode) = matched_barcodes.into_iter().next() else {
-                continue;
-            };
-
-            let Some(date) = candidate_date.get(barcode.as_str()) else {
-                errors += 1;
-                continue;
-            };
-            
-            let volume_name = match volume_name_from_date(date) {
-                Ok(v) => v,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
-
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            manifest_entries.push(StagedManifestEntry {
-                relative_path: format!("{subfolder}/{filename}"),
-                source_subfolder: subfolder.clone(),
-                barcode,
-                original_size: size,
-                volume_name,
-            });
-        }
+        manifest_entries.extend(outcome.entries);
     }
 
     if let Some(cb) = progress_callback {
@@ -475,40 +520,84 @@ where
     fs::create_dir_all(&config.staging_dir).map_err(|e| ArchiveError::io(&config.staging_dir, e))?;
     let mut manifest_writer = StagingManifestWriter::create(&config.staging_dir, session_id)?;
 
-    // Crash-correct ordering: a manifest line is written and FLUSHED before
+    // Crash-correct ordering: a manifest line is written and SYNCED before
     // the rename of the file it describes. Lines are written in batches of
-    // FLUSH_EVERY and flushed before any file of that batch is renamed, so a
+    // FLUSH_EVERY and synced before any file of that batch is renamed, so a
     // renamed file can never be missing from the manifest. A listed file that
-    // was not renamed yet is simply still in the source tree (resume skips
-    // listed files that are absent from staging).
+    // was not renamed (yet, or because the rename failed) is simply still in
+    // the source tree; resume skips listed files that are absent from staging.
+    //
+    // Renames run in parallel. A file that cannot be moved (locked by the
+    // tester, permissions) is counted as an error and left in the source; it
+    // is picked up again by a later run. A file whose staging path is already
+    // taken is never overwritten (that file could be the only copy).
     let total_to_stage = manifest_entries.len();
+    let mut dirs_made: HashSet<PathBuf> = HashSet::new();
+    let mut staged_ok = 0usize;
+    let mut stage_failures: Vec<String> = Vec::new();
+    // Entries that were not moved: not archived by this run (a resume after a
+    // crash may still pick up a same-named file in staging; never lost).
+    let mut not_staged: HashSet<usize> = HashSet::new();
     for (batch_no, batch) in manifest_entries.chunks(StagingManifestWriter::FLUSH_EVERY).enumerate() {
         for entry in batch {
             manifest_writer.record(entry.clone())?;
         }
         manifest_writer.flush()?;
 
-        for (j, entry) in batch.iter().enumerate() {
-            let i = batch_no * StagingManifestWriter::FLUSH_EVERY + j;
-            if i % 1000 == 0 || i == total_to_stage - 1 {
-                if let Some(cb) = progress_callback {
-                    cb(format!("Staging file {} of {}...", i + 1, total_to_stage), i, total_to_stage);
-                }
-            }
-
-            let source_path = config.source_dir.join(&entry.relative_path);
+        for entry in batch {
             let staged_path = config.staging_dir.join(&entry.relative_path);
             if let Some(parent) = staged_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+                if dirs_made.insert(parent.to_path_buf()) {
+                    fs::create_dir_all(parent).map_err(|e| ArchiveError::io(parent, e))?;
+                }
             }
-            fs::rename(&source_path, &staged_path).map_err(|e| ArchiveError::io(&staged_path, e))?;
+        }
+        let offset = batch_no * StagingManifestWriter::FLUSH_EVERY;
+        let results = crate::par::map(
+            batch,
+            workers,
+            |entry| stage_one(config, entry),
+            |done| {
+                if let Some(cb) = progress_callback {
+                    cb(format!("Staging file {} of {}...", offset + done, total_to_stage), offset + done, total_to_stage);
+                }
+            },
+        );
+        for (j, r) in results.into_iter().enumerate() {
+            match r {
+                Ok(()) => staged_ok += 1,
+                Err(msg) => {
+                    stage_failures.push(msg);
+                    not_staged.insert(offset + j);
+                }
+            }
         }
     }
     manifest_writer.finish()?;
+    if !stage_failures.is_empty() {
+        errors += stage_failures.len() as i64;
+        if let Some(cb) = progress_callback {
+            cb(
+                format!(
+                    "Warning: {} of {} file(s) could not be moved into staging and were left in the source folder (first: {}).",
+                    stage_failures.len(),
+                    total_to_stage,
+                    stage_failures[0]
+                ),
+                staged_ok,
+                total_to_stage,
+            );
+        }
+    }
 
     let manifest = StagingManifest {
         scan_session_id: session_id,
-        files: manifest_entries.clone(),
+        files: manifest_entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !not_staged.contains(i))
+            .map(|(_, e)| e.clone())
+            .collect(),
     };
 
     let result = finish_staged_batch(conn, config, &manifest, progress_callback)?;
@@ -566,122 +655,132 @@ where
         by_volume.entry(entry.volume_name.clone()).or_default().push(entry);
     }
 
+    let workers = crate::par::worker_count(config.workers);
     let total_to_archive = manifest.files.len();
-    let mut processed = 0usize;
     let mut all_staged_present: Vec<StagedManifestEntry> = Vec::new();
     let mut touched_volume_names = Vec::new();
     let mut archive_breakdown: Vec<VolumeBreakdown> = Vec::new();
     let mut durability_notes: Vec<String> = Vec::new();
+    // A month that fails does not stop the others: its staged files and the
+    // manifest stay for the next run, which retries only what is left.
+    let mut failures: Vec<ArchiveError> = Vec::new();
 
+    // Only files still present in staging are archived (resume tolerance).
+    let mut jobs: Vec<VolumeJob> = Vec::new();
     for (volume_name, entries) in &by_volume {
-        let volume_path = mochi_store::volume_path(&config.output_dir, volume_name);
-
-        // Only files still present in staging are archived (resume tolerance).
-        let mut staged_present: Vec<StagedManifestEntry> = Vec::new();
-        let mut store_files: Vec<StoreFile> = Vec::new();
+        let mut job = VolumeJob {
+            volume_name: volume_name.clone(),
+            store_files: Vec::new(),
+            staged_present: Vec::new(),
+            // The head the index recorded after the last verified write.
+            indexed_head: repo::volume_head(conn, volume_name)?,
+        };
         for entry in entries {
-            processed += 1;
-            if processed % 250 == 0 || processed == total_to_archive {
-                if let Some(cb) = progress_callback {
-                    cb(format!("Preparing file {} of {} ({volume_name})...", processed, total_to_archive), processed, total_to_archive);
-                }
-            }
             let staged_path = config.staging_dir.join(&entry.relative_path);
             if !staged_path.exists() {
                 continue;
             }
-            store_files.push(StoreFile {
+            job.store_files.push(StoreFile {
                 relative_path: entry.relative_path.clone(),
                 staged_path,
             });
-            staged_present.push((*entry).clone());
+            job.staged_present.push((*entry).clone());
         }
-        if store_files.is_empty() {
-            continue;
+        if !job.store_files.is_empty() {
+            jobs.push(job);
         }
+    }
 
-        if let Some(cb) = progress_callback {
-            cb(format!("Committing {} file(s) to {volume_name}.mochi...", store_files.len()), processed, total_to_archive);
-        }
-        let finished = mochi_store::store_volume(&volume_path, &store_files)?;
-
-        if let Some(cb) = progress_callback {
-            cb(format!("Verifying committed archive {volume_name}.mochi (read-only)..."), processed, total_to_archive);
-        }
-        // Verify before deleting any originals. Any failure aborts here and
-        // leaves staging and the manifest untouched.
-        mochi_store::verify_volume(&volume_path, &store_files)?;
-        if let Some(why) = &finished.degraded_durability {
-            // Committed (LOCAL_COMMITTED) but the directory entry is not confirmed durable.
-            if let Some(cb) = progress_callback {
-                cb(
-                    format!("DEGRADED (not an error): {volume_name}.mochi is committed (LOCAL_COMMITTED), but durability of its directory entry is unconfirmed: {why}. Keep an independent copy."),
-                    processed,
-                    total_to_archive,
-                );
-            }
-            durability_notes.push(format!("{volume_name}: {why}"));
-        }
-        if finished.entry_count < staged_present.len() {
-            return Err(ArchiveError::VerificationFailed {
-                volume: volume_name.clone(),
-                reason: format!(
-                    "committed {} entries but expected {}. Aborting cleanup.",
-                    finished.entry_count,
-                    staged_present.len()
-                ),
+    // Months are separate archives with separate writer locks, so several are
+    // committed and verified at once. Workers never touch SQLite or delete
+    // anything: they report back here, and this thread indexes a month and
+    // then removes its staged copies.
+    let parallel_months = (workers / 2).clamp(1, jobs.len().max(1));
+    let per_month_workers = (workers / parallel_months).max(1);
+    let done_files = AtomicUsize::new(0);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel::<VolumeMsg>();
+        for _ in 0..parallel_months {
+            let sender = sender.clone();
+            let (jobs, next) = (&jobs, &next);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(i) else { break };
+                let say = |m: String| {
+                    let _ = sender.send(VolumeMsg::Progress(m));
+                };
+                let outcome = commit_and_verify(config, job, per_month_workers, &say);
+                let _ = sender.send(VolumeMsg::Done(i, Box::new(outcome)));
             });
         }
+        drop(sender);
 
-        let now = started_at_now();
-        let barcode_lookup: HashMap<&str, &str> = staged_present
-            .iter()
-            .map(|e| (e.relative_path.as_str(), e.barcode.as_str()))
-            .collect();
-        let subfolder_lookup: HashMap<&str, &str> = staged_present
-            .iter()
-            .map(|e| (e.relative_path.as_str(), e.source_subfolder.as_str()))
-            .collect();
+        for msg in receiver {
+            let processed = done_files.load(Ordering::Relaxed);
+            match msg {
+                VolumeMsg::Progress(m) => {
+                    if let Some(cb) = progress_callback {
+                        cb(m, processed, total_to_archive);
+                    }
+                }
+                VolumeMsg::Done(i, outcome) => {
+                    let job = &jobs[i];
+                    done_files.fetch_add(job.store_files.len(), Ordering::Relaxed);
+                    let indexed = (*outcome).and_then(|finished| {
+                        index_and_clean(conn, effective_session_id, job, &finished, per_month_workers.max(workers / 2), progress_callback)
+                            .map(|()| finished)
+                    });
+                    match indexed {
+                        Ok(finished) => {
+                            if let Some(why) = &finished.degraded_durability {
+                                durability_notes.push(format!("{}: {why}", job.volume_name));
+                            }
+                            archive_breakdown.push(VolumeBreakdown {
+                                volume_name: job.volume_name.clone(),
+                                files_archived: job.staged_present.len(),
+                                total_bytes: job.staged_present.iter().map(|e| e.original_size).sum(),
+                            });
+                            touched_volume_names.push(job.volume_name.clone());
+                            all_staged_present.extend(job.staged_present.iter().cloned());
+                        }
+                        Err(e) => {
+                            if let Some(cb) = progress_callback {
+                                cb(
+                                    format!(
+                                        "ERROR: {}.mochi: {e}. Its {} staged file(s) are kept in staging for the next run.",
+                                        job.volume_name,
+                                        job.store_files.len()
+                                    ),
+                                    processed,
+                                    total_to_archive,
+                                );
+                            }
+                            failures.push(e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    archive_breakdown.sort_by(|a, b| a.volume_name.cmp(&b.volume_name));
+    touched_volume_names.sort();
 
-        repo::record_finished_volume(
-            conn,
-            effective_session_id,
-            volume_name,
-            &finished,
-            &now,
-            |path| barcode_lookup.get(path).map(|s| s.to_string()),
-            |path| subfolder_lookup.get(path).map(|s| s.to_string()).unwrap_or_default(),
-        )?;
-
-        let volume_bytes: u64 = staged_present.iter().map(|e| e.original_size).sum();
-        archive_breakdown.push(VolumeBreakdown {
-            volume_name: volume_name.clone(),
-            files_archived: staged_present.len(),
-            total_bytes: volume_bytes,
-        });
-
-        touched_volume_names.push(volume_name.clone());
-        all_staged_present.extend(staged_present);
+    if let Some(first) = failures.into_iter().next() {
+        // The manifest stays: the next run resumes the failed months.
+        return Err(first);
     }
 
     if let Some(cb) = progress_callback {
         cb("Verification complete across all months. Cleaning up staging area...".to_string(), total_to_archive, total_to_archive);
     }
 
-    // 4. Cleanup: everything below was committed, verified and saved to the DB.
-    // Delete ONLY the files the manifest lists (and that were verified), then the
-    // manifest, then directories that are now empty. Anything else found in
-    // staging (e.g. a file renamed in by a crashed run whose manifest line was
-    // lost) is never deleted: it stays, is counted as an error and reported.
+    // 4. Cleanup: every month's verified files were already deleted right
+    // after that month was indexed. Now the manifest, then directories that
+    // are now empty. Anything else found in staging (e.g. a file renamed in
+    // by a crashed run whose manifest line was lost) is never deleted: it
+    // stays, is counted as an error and reported.
     let files_deleted = all_staged_present.len();
-    for e in &all_staged_present {
-        let p = config.staging_dir.join(&e.relative_path);
-        match fs::remove_file(&p) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(ArchiveError::io(&p, err)),
-        }
-    }
     let manifest_path = StagingManifest::path_in(&config.staging_dir);
     match fs::remove_file(&manifest_path) {
         Ok(()) => {}
@@ -735,6 +834,129 @@ where
         files_deleted,
         durability_notes,
     })
+}
+
+/// One month's share of a staged batch.
+struct VolumeJob {
+    volume_name: String,
+    store_files: Vec<StoreFile>,
+    staged_present: Vec<StagedManifestEntry>,
+    indexed_head: Option<(String, u64)>,
+}
+
+/// From a month worker to the thread that owns the index.
+enum VolumeMsg {
+    Progress(String),
+    Done(usize, Box<Result<mochi_store::FinishedVolume>>),
+}
+
+/// Commits one month's staged files and verifies them (no index writes, no
+/// deletes: safe on a worker thread).
+fn commit_and_verify(
+    config: &SessionConfig,
+    job: &VolumeJob,
+    workers: usize,
+    say: &dyn Fn(String),
+) -> Result<mochi_store::FinishedVolume> {
+    let volume_name = &job.volume_name;
+    let volume_path = mochi_store::volume_path(&config.output_dir, volume_name);
+    let n = job.store_files.len();
+
+    say(format!("Committing {n} file(s) to {volume_name}.mochi..."));
+    let finished = mochi_store::store_volume_with(
+        &volume_path,
+        &job.store_files,
+        &mochi_store::StoreOptions {
+            workers,
+            ..mochi_store::StoreOptions::default()
+        },
+    )?;
+
+    // The head before this run's commits was verified by an earlier run if
+    // it is the head the index recorded (the index is written only after a
+    // successful verification). Then only the new commits need the
+    // structural check; otherwise the whole archive is checked.
+    let since = finished.prior_head.filter(|prior| {
+        job.indexed_head
+            .as_ref()
+            .is_some_and(|(id, seq)| *id == prior.commit_id.to_hex() && *seq == prior.seq)
+    });
+    say(format!(
+        "Verifying {n} file(s) in {volume_name}.mochi (read-only, {})...",
+        if since.is_some() { "new commits" } else { "whole archive" }
+    ));
+    // Verify before deleting any originals. Any failure aborts here and
+    // leaves this month's staged files and the manifest untouched.
+    mochi_store::verify_volume_with(&volume_path, &job.store_files, since.as_ref(), workers, |done| {
+        say(format!("Verified {done} of {n} file(s) in {volume_name}.mochi..."));
+    })?;
+    if let Some(why) = &finished.degraded_durability {
+        // Committed (LOCAL_COMMITTED) but the directory entry is not confirmed durable.
+        say(format!("DEGRADED (not an error): {volume_name}.mochi is committed (LOCAL_COMMITTED), but durability of its directory entry is unconfirmed: {why}. Keep an independent copy."));
+    }
+    if finished.entry_count < job.staged_present.len() {
+        return Err(ArchiveError::VerificationFailed {
+            volume: volume_name.clone(),
+            reason: format!(
+                "committed {} entries but expected {}. Aborting cleanup.",
+                finished.entry_count,
+                job.staged_present.len()
+            ),
+        });
+    }
+    Ok(finished)
+}
+
+/// Indexes a committed and verified month, then deletes its staged copies.
+fn index_and_clean<F>(
+    conn: &mut Connection,
+    session_id: i64,
+    job: &VolumeJob,
+    finished: &mochi_store::FinishedVolume,
+    workers: usize,
+    progress_callback: Option<&F>,
+) -> Result<()>
+where
+    F: Fn(String, usize, usize),
+{
+    let volume_name = &job.volume_name;
+    let n = job.store_files.len();
+    let say = |msg: String| {
+        if let Some(cb) = progress_callback {
+            cb(msg, 0, 0);
+        }
+    };
+    let now = started_at_now();
+    let lookup: HashMap<&str, (&str, &str)> = job
+        .staged_present
+        .iter()
+        .map(|e| (e.relative_path.as_str(), (e.barcode.as_str(), e.source_subfolder.as_str())))
+        .collect();
+    say(format!("Indexing {} file(s) of {volume_name}.mochi...", finished.written_entries.len()));
+    repo::record_finished_volume(
+        conn,
+        session_id,
+        volume_name,
+        finished,
+        &now,
+        |path| lookup.get(path).map(|(b, _)| b.to_string()),
+        |path| lookup.get(path).map(|(_, s)| s.to_string()).unwrap_or_default(),
+    )?;
+
+    // Committed, verified and indexed: these staged copies may go. The
+    // manifest still lists them; a resume skips listed files that are gone.
+    let results = crate::par::map(
+        &job.store_files,
+        workers,
+        |f| match fs::remove_file(&f.staged_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(ArchiveError::io(&f.staged_path, err)),
+        },
+        |done| say(format!("Removed {done} of {n} staged file(s) of {volume_name}...")),
+    );
+    results.into_iter().collect::<Result<Vec<()>>>()?;
+    Ok(())
 }
 
 /// Removes empty directories under (and including) `dir`, bottom-up. Files that
@@ -881,6 +1103,7 @@ mod tests {
             allowed_extensions: vec!["txt".into()],
             lookback_days: 2,
             date_range_override: None,
+            workers: 0,
         };
 
         let result = finish_staged_batch::<fn(String, usize, usize)>(&mut conn, &config, &manifest, None);

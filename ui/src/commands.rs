@@ -156,6 +156,7 @@ pub async fn run_session(req: RunRequest, app: AppHandle, state: State<'_, AppSt
                 .date_to
                 .filter(|to| !to.trim().is_empty())
                 .map(|to| (req.date_from.unwrap_or_default(), to)),
+            workers: 0,
         },
         email,
         dry_run: req.dry_run,

@@ -9,7 +9,7 @@
 
 use crate::error::{ArchiveError, Result};
 use crate::mochi_store::archive_path_of;
-use mochi_core::catalog::namespace::EntryKind;
+use mochi_core::catalog::namespace::{EntryKind, Snapshot};
 use mochi_core::job::{CancellationToken, JobContext, NullProgress};
 use mochi_core::publish::{open_head, OpenedHead, ReadOptions};
 use mochi_core::storage::os::OsReadStorage;
@@ -23,6 +23,9 @@ use std::path::{Component, Path, PathBuf};
 struct OpenVolume {
     src: OsReadStorage,
     head: OpenedHead,
+    /// The head namespace, replayed once at open: reading by version from it
+    /// keeps extracting N files linear (`read::read_file` replays per call).
+    snapshot: Snapshot,
     ro: ReadOptions,
     path: PathBuf,
 }
@@ -33,9 +36,11 @@ impl OpenVolume {
         let src = OsReadStorage::open(volume_path).map_err(|e| map(MochiError::from(e)))?;
         let ro = ReadOptions::default();
         let head = open_head(&src, &ro).map_err(map)?;
+        let snapshot = head.catalog.replay(None).map_err(map)?;
         Ok(OpenVolume {
             src,
             head,
+            snapshot,
             ro,
             path: volume_path.to_path_buf(),
         })
@@ -54,23 +59,33 @@ impl OpenVolume {
             progress: &NullProgress,
             cancel: &cancel,
         };
-        match mochi_core::read::read_file(&self.src, &self.head, &path, out, &self.ro, &ctx) {
-            Ok(r) => Ok(r.logical_len),
-            Err(e) if e.code == mochi_core::ErrorCode::InvalidArgument && e.message.starts_with("no entry") => {
-                Err(ArchiveError::EntryNotFound(relative_path.to_string()))
-            }
-            Err(e) => Err(self.map(e)),
+        let entry = self
+            .snapshot
+            .get(&path)
+            .ok_or_else(|| ArchiveError::EntryNotFound(relative_path.to_string()))?;
+        if entry.kind == EntryKind::Directory {
+            return Err(self.map(MochiError::new(
+                mochi_core::ErrorCode::InvalidArgument,
+                format!("{relative_path:?} is a directory"),
+            )));
         }
+        mochi_core::read::read_version(&self.src, &self.head.catalog, &entry.version, out, &self.ro, &ctx)
+            .map(|r| r.logical_len)
+            .map_err(|e| self.map(e))
     }
 
     /// Logical size of a file entry, if present.
     fn file_size(&self, relative_path: &str) -> Result<Option<u64>> {
         let path = archive_path_of(relative_path)?;
-        let list = mochi_core::read::list(&self.head, Some(&path)).map_err(|e| self.map(e))?;
-        Ok(list
-            .into_iter()
-            .find(|e| e.path == path && e.kind == EntryKind::File)
-            .map(|e| e.logical_len))
+        let Some(entry) = self.snapshot.get(&path).filter(|e| e.kind == EntryKind::File) else {
+            return Ok(None);
+        };
+        Ok(self
+            .head
+            .catalog
+            .file_version(&entry.version)
+            .map_err(|e| self.map(e))?
+            .map(|(v, _)| v.logical_len))
     }
 }
 
