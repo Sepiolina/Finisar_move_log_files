@@ -99,11 +99,12 @@ pub fn record_session_barcode(
     last_update: &str,
     status: BarcodeStatus,
 ) -> Result<Option<i64>> {
-    let result = conn.execute(
-        "INSERT INTO session_barcode (scan_session_id, barcode, last_update, status)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![scan_session_id, barcode, last_update, status.as_str()],
-    );
+    let result = conn
+        .prepare_cached(
+            "INSERT INTO session_barcode (scan_session_id, barcode, last_update, status)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![scan_session_id, barcode, last_update, status.as_str()]);
 
     match result {
         Ok(_) => Ok(Some(conn.last_insert_rowid())),
@@ -118,11 +119,9 @@ pub fn record_session_barcode(
 
 /// Checks if a barcode was scanned previously (used to skip unneeded work early).
 pub fn is_barcode_already_scanned(conn: &Connection, barcode: &str, last_update: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM session_barcode WHERE barcode = ?1 AND last_update = ?2",
-        params![barcode, last_update],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM session_barcode WHERE barcode = ?1 AND last_update = ?2")?
+        .query_row(params![barcode, last_update], |row| row.get(0))?;
     Ok(count > 0)
 }
 
@@ -135,6 +134,22 @@ pub fn find_volume_by_name(conn: &Connection, volume_name: &str) -> Result<Optio
     )
     .optional()
     .map_err(ArchiveError::from)
+}
+
+/// The MOCHI head (commit id hex, sequence) recorded for a volume after its
+/// last verified write, if any.
+pub fn volume_head(conn: &Connection, volume_name: &str) -> Result<Option<(String, u64)>> {
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT head_commit_id, head_seq FROM file_storage_volume WHERE volume_name = ?1",
+            params![volume_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(id), Some(seq))) if !id.is_empty() && seq >= 0 => Some((id, seq as u64)),
+        _ => None,
+    })
 }
 
 /// Inserts a new volume or updates an existing one with the new size, MOCHI head and totals.
@@ -217,7 +232,7 @@ pub struct LogEntryInsert<'a> {
 /// or a newer version of the same file name in the same month) it is updated
 /// in place to describe the latest committed version.
 pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO scanned_log_entry
             (scan_session_id, barcode, relative_path, source_subfolder,
              content_hash, commit_seq, original_size, file_storage_volume_id)
@@ -229,7 +244,8 @@ pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64
              content_hash = excluded.content_hash,
              commit_seq = excluded.commit_seq,
              original_size = excluded.original_size",
-        params![
+    )?
+    .execute(params![
             entry.scan_session_id,
             entry.barcode,
             entry.relative_path,
@@ -238,14 +254,10 @@ pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64
             entry.commit_seq as i64,
             entry.original_size as i64,
             entry.file_storage_volume_id,
-        ],
-    )?;
-    conn.query_row(
-        "SELECT id FROM scanned_log_entry WHERE relative_path = ?1 AND file_storage_volume_id = ?2",
-        params![entry.relative_path, entry.file_storage_volume_id],
-        |r| r.get(0),
-    )
-    .map_err(ArchiveError::from)
+        ])?;
+    conn.prepare_cached("SELECT id FROM scanned_log_entry WHERE relative_path = ?1 AND file_storage_volume_id = ?2")?
+        .query_row(params![entry.relative_path, entry.file_storage_volume_id], |r| r.get(0))
+        .map_err(ArchiveError::from)
 }
 
 /// Where an indexed file lives (used for extraction and search panels).
