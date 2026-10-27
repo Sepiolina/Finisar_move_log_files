@@ -12,23 +12,17 @@ pub struct UiSettings {
     pub staging_dir: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
     pub extension_filter: Vec<String>,
-    /// TEXT-form date (YYYY-MM-DD) of the last successful scan's
-    /// query_to_date — read back from the SQLite index at startup
-    /// (`repo::last_successful_scan_to_date`) rather than duplicated
-    /// here, but kept as a cached display value so the UI can show it
-    /// without a DB round trip on every frame.
+    /// YYYY-MM-DD `query_to_date` of the last successful scan. Display cache only:
+    /// refreshed from the SQLite index at startup.
     pub last_successful_scan_to_date: Option<String>,
     pub dry_run: bool,
 
-    /// Statistics email — sent after each real (non-dry-run) session
-    /// completes. `#[serde(default)]` so settings.json files saved
-    /// before this feature existed still load instead of falling back
-    /// to defaults for everything.
+    /// Statistics email after each real (non-dry-run) session. The email fields are
+    /// `#[serde(default)]` so settings files saved before they existed still load.
     #[serde(default)]
     pub email_stats_enabled: bool,
-    /// Scheme+host+port of the internal email relay, e.g.
-    /// `http://10.0.0.5:8080` — no path. `/api/email/send` is appended
-    /// by `archiver_core::email_report`.
+    /// Email relay scheme+host+port only (e.g. `http://10.0.0.5:8080`);
+    /// `archiver_core::email_report` appends the API path.
     #[serde(default)]
     pub email_api_base_url: String,
     #[serde(default)]
@@ -52,10 +46,15 @@ impl Default for UiSettings {
     }
 }
 
+/// The per-user config directory (settings.json, encrypted DB config), if the OS has one.
+pub fn config_dir() -> Option<PathBuf> {
+    directories_next::ProjectDirs::from("com", "log-archiver", "log-archiver").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
 impl UiSettings {
     pub fn settings_path() -> PathBuf {
-        directories_next::ProjectDirs::from("com", "log-archiver", "log-archiver")
-            .map(|dirs| dirs.config_dir().join("settings.json"))
+        config_dir()
+            .map(|dir| dir.join("settings.json"))
             .unwrap_or_else(|| PathBuf::from("settings.json"))
     }
 
@@ -96,14 +95,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        let mut settings = UiSettings::default();
-        settings.email_stats_enabled = true;
-        settings.email_api_base_url = "http://10.0.0.5:8080".to_string();
-        settings.email_recipient = "ops-team@example.com".to_string();
+        let settings = UiSettings {
+            email_stats_enabled: true,
+            email_api_base_url: "http://10.0.0.5:8080".to_string(),
+            email_recipient: "ops-team@example.com".to_string(),
+            ..UiSettings::default()
+        };
         settings.save_to(&path);
 
         let loaded = UiSettings::load_from(&path);
-        assert_eq!(loaded.email_stats_enabled, true);
+        assert!(loaded.email_stats_enabled);
         assert_eq!(loaded.email_api_base_url, "http://10.0.0.5:8080");
         assert_eq!(loaded.email_recipient, "ops-team@example.com");
     }
@@ -132,7 +133,7 @@ mod tests {
 
         let loaded = UiSettings::load_from(&path);
         assert_eq!(loaded.source_dir, Some(PathBuf::from("/data/source")));
-        assert_eq!(loaded.email_stats_enabled, false);
+        assert!(!loaded.email_stats_enabled);
         assert_eq!(loaded.email_api_base_url, "");
         assert_eq!(loaded.email_recipient, "");
     }

@@ -236,13 +236,12 @@ function renderArchive(r) {
       card("Files that would move (first 50)", list(r.matchedFilenames.slice(0, 50), r.matchedFilenames.length))));
     return;
   }
-  const errors = Array.isArray(r.errors) ? r.errors.length : r.errors;
   const rows = r.archiveBreakdown.map((b) => el("tr", {},
     el("td", { class: "path" }, b.volumeName), el("td", { class: "num" }, num(b.filesArchived)), el("td", { class: "num" }, fmtBytes(b.totalBytes))));
   out.replaceChildren(el("div", { class: "result" },
     tiles([
       [num(r.filesMoved), "Files archived", "good"], [num(r.barcodesMatched), "Barcodes matched"],
-      [num(r.totalFilesScanned), "Files scanned"], [num(errors), "Errors", errors > 0 ? "bad" : ""],
+      [num(r.totalFilesScanned), "Files scanned"], [num(r.errors), "Errors", r.errors > 0 ? "bad" : ""],
       [num(r.dbRecordsRetrieved), "DB records"], [num(r.filesDeleted), "Staging files cleaned"],
       [fmtDuration(r.durationSecs), "Duration"],
     ]),
