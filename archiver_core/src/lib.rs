@@ -11,4 +11,3 @@ pub mod secure_config;
 pub mod session;
 
 pub use error::{ArchiveError, Result};
-pub use mochi_store::{FinishedVolume, StoreFile, StoreOptions, StoredEntry, COMMIT_BYTE_BUDGET, COMMIT_FILE_BUDGET};
