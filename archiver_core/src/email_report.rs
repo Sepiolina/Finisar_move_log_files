@@ -1,28 +1,27 @@
 use crate::error::{ArchiveError, Result};
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-// Must be under 100kb
+
+/// The relay rejects bodies of 100 KB or more; keep a safety margin.
 const MAX_BODY_BYTES: usize = 95_000;
 
-#[derive(Debug, Clone)]
-pub struct ArchiveBreakdownRow {
-    pub volume_name: String,
-    pub files_archived: usize,
-    pub total_bytes: u64,
-}
+/// Timeout for each network step (connect, send, read response).
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Everything the email report needs about one session run. Built by
-/// the caller (the UI worker thread) from `session::SessionResult` plus
-/// the details only the worker knows — wall-clock duration and the raw
-/// DB record count — since `session::run_session` itself has no notion
-/// of email and shouldn't need one.
+/// One row of the "Archives Breakdown" table: the same shape as the
+/// session's per-volume breakdown.
+pub use crate::session::VolumeBreakdown as ArchiveBreakdownRow;
+
+/// Everything the email report needs about one session run. The UI builds
+/// it from `session::SessionResult` plus what only it knows (wall-clock
+/// duration, raw DB record count).
 #[derive(Debug, Clone)]
 pub struct SessionStats {
-    /// Human-readable label for when the run started (local time is
-    /// fine — this is for a human reading an email, not a DB key).
+    /// When the run started, for a human reader (local time is fine).
     pub started_label: String,
     pub duration_secs: f64,
     pub db_records_retrieved: usize,
@@ -31,8 +30,7 @@ pub struct SessionStats {
     pub total_files_archived: usize,
     pub total_files_deleted: usize,
     pub archive_breakdown: Vec<ArchiveBreakdownRow>,
-    /// Barcodes the DB returned as candidates but for which no matching
-    /// file was found in any configured subfolder this run.
+    /// DB candidates with no matching file in any configured subfolder.
     pub unmatched_barcodes: Vec<String>,
     pub errors: usize,
     /// `Some(message)` if the session failed outright rather than
@@ -40,10 +38,9 @@ pub struct SessionStats {
     pub failed: Option<String>,
 }
 
-/// Where to send the report. `api_base_url` is the scheme+host+port
-/// only (e.g. `http://10.0.0.5:8080`), never including the `/api/...`
-/// path — that's fixed and appended here so a config typo can't send
-/// requests to the wrong route.
+/// Where to send the report. `api_base_url` is scheme+host+port only
+/// (e.g. `http://10.0.0.5:8080`); the `/api/email/send` path is fixed and
+/// appended here so a config typo can't send requests to the wrong route.
 #[derive(Debug, Clone)]
 pub struct EmailConfig {
     pub api_base_url: String,
@@ -57,15 +54,11 @@ struct EmailRequest<'a> {
     body: String,
 }
 
-/// Default subject line: short, and carries the headline numbers so it
-/// is useful even in a notification preview / inbox list without
-/// opening the email.
+/// Default subject line, carrying the headline numbers so it is useful in
+/// an inbox list without opening the email.
 pub fn default_subject(stats: &SessionStats) -> String {
     match &stats.failed {
-        Some(_) => format!(
-            "Log Archiver — Session FAILED ({})",
-            stats.started_label
-        ),
+        Some(_) => format!("Log Archiver — Session FAILED ({})", stats.started_label),
         None => format!(
             "Log Archiver — {} archived, {} unmatched, {} errors ({})",
             stats.total_files_archived,
@@ -76,18 +69,18 @@ pub fn default_subject(stats: &SessionStats) -> String {
     }
 }
 
-/// POSTs the statistics report to the configured relay. Returns an
-/// error on any transport or non-2xx-status failure; callers should
-/// treat that as non-fatal to the session it's reporting on.
+/// POSTs the statistics report to the configured relay. Returns an error on
+/// any transport failure or non-2xx status; callers should treat that as
+/// non-fatal to the session being reported on.
 ///
-/// This speaks raw HTTP/1.1 over a plain TCP socket rather than pulling
-/// in a full HTTP client crate: the relay is an internal, unauthenticated,
-/// plain-`http://` endpoint (per spec: `POST http://HOST:PORT/api/email/send`),
-/// so a minimal client keeps the dependency footprint down without
-/// giving anything up functionally. `api_base_url` is assumed to be
-/// `http://host:port` (or `host:port`) — a bare host/IPv4 and port, no
-/// TLS, no path segment beyond what's appended here.
-pub async fn send_stats_email(config: &EmailConfig, subject: &str, stats: &SessionStats) -> Result<()> {
+/// Speaks minimal HTTP/1.1 over plain TCP instead of pulling in an HTTP
+/// client: the relay is an internal, unauthenticated `http://host:port`
+/// endpoint (no TLS, no path prefix).
+pub async fn send_stats_email(
+    config: &EmailConfig,
+    subject: &str,
+    stats: &SessionStats,
+) -> Result<()> {
     let body = render_html(stats);
     let (host, port) = parse_host_port(&config.api_base_url)?;
     let addr = format!("{host}:{port}");
@@ -100,8 +93,6 @@ pub async fn send_stats_email(config: &EmailConfig, subject: &str, stats: &Sessi
     let json_body = serde_json::to_vec(&payload)
         .map_err(|e| ArchiveError::Email(format!("failed to serialize email payload: {e}")))?;
 
-    const IO_TIMEOUT: Duration = Duration::from_secs(20);
-
     let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(&addr))
         .await
         .map_err(|_| ArchiveError::Email(format!("timed out connecting to {addr}")))?
@@ -113,7 +104,6 @@ pub async fn send_stats_email(config: &EmailConfig, subject: &str, stats: &Sessi
          Content-Type: application/json\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\r\n",
-        host = host,
         len = json_body.len()
     );
 
@@ -161,36 +151,36 @@ fn parse_host_port(base: &str) -> Result<(String, u16)> {
         .trim_start_matches("http://")
         .trim_start_matches("https://");
 
-    let (host, port_str) = without_scheme
-        .rsplit_once(':')
-        .ok_or_else(|| ArchiveError::Email(format!("invalid email API URL {base:?}: expected host:port")))?;
+    let (host, port_str) = without_scheme.rsplit_once(':').ok_or_else(|| {
+        ArchiveError::Email(format!(
+            "invalid email API URL {base:?}: expected host:port"
+        ))
+    })?;
 
     if host.is_empty() {
-        return Err(ArchiveError::Email(format!("invalid email API URL {base:?}: missing host")));
+        return Err(ArchiveError::Email(format!(
+            "invalid email API URL {base:?}: missing host"
+        )));
     }
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| ArchiveError::Email(format!("invalid email API URL {base:?}: bad port {port_str:?}")))?;
+    let port: u16 = port_str.parse().map_err(|_| {
+        ArchiveError::Email(format!(
+            "invalid email API URL {base:?}: bad port {port_str:?}"
+        ))
+    })?;
 
     Ok((host.to_string(), port))
 }
 
 /// Renders the HTML report, shrinking the two unbounded sections
 /// (archive breakdown, unmatched barcodes) as needed to stay under
-/// `MAX_BODY_BYTES`. Everything else in the report is fixed-size
-/// (single numbers), so those two lists are the only things that can
-/// push the body over budget on a large run.
+/// `MAX_BODY_BYTES`. Everything else in the report is fixed-size.
 fn render_html(stats: &SessionStats) -> String {
-    let total_rows = stats.archive_breakdown.len();
-    let total_unmatched = stats.unmatched_barcodes.len();
-
-    let mut row_cap = total_rows;
-    let mut unmatched_cap = total_unmatched;
+    let mut row_cap = stats.archive_breakdown.len();
+    let mut unmatched_cap = stats.unmatched_barcodes.len();
 
     let mut html = render_with_caps(stats, row_cap, unmatched_cap);
     while html.len() > MAX_BODY_BYTES && (row_cap > 0 || unmatched_cap > 0) {
-        // Shrink whichever list is currently larger first — that's the
-        // one most likely responsible for the overage.
+        // Halve the larger list first: it is the likeliest cause.
         if unmatched_cap >= row_cap {
             unmatched_cap /= 2;
         } else {
@@ -199,10 +189,9 @@ fn render_html(stats: &SessionStats) -> String {
         html = render_with_caps(stats, row_cap, unmatched_cap);
     }
 
-    // Last resort: even the minimal render (both lists collapsed to a
-    // single "N items, see the app for details" line) shouldn't be able
-    // to exceed the budget, but hard-truncate on a safe boundary rather
-    // than ever POSTing an oversized body.
+    // Last resort (should be unreachable: with both lists collapsed the
+    // body is small): hard-truncate on a char boundary rather than ever
+    // POSTing an oversized body.
     if html.len() > MAX_BODY_BYTES {
         let mut cut = MAX_BODY_BYTES;
         while !html.is_char_boundary(cut) {
@@ -217,42 +206,70 @@ fn render_html(stats: &SessionStats) -> String {
 
 fn render_with_caps(stats: &SessionStats, row_cap: usize, unmatched_cap: usize) -> String {
     let mut s = String::with_capacity(4096);
+    write_report(&mut s, stats, row_cap, unmatched_cap)
+        .expect("formatting into a String cannot fail");
+    s
+}
 
-    s.push_str("<html><body style=\"font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;\">");
+/// Writes the report, showing at most `row_cap` breakdown rows and
+/// `unmatched_cap` unmatched barcodes.
+fn write_report(
+    s: &mut String,
+    stats: &SessionStats,
+    row_cap: usize,
+    unmatched_cap: usize,
+) -> std::fmt::Result {
+    s.push_str(
+        "<html><body style=\"font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;\">",
+    );
 
     if let Some(err) = &stats.failed {
-        s.push_str(&format!(
+        write!(
+            s,
             "<p style=\"color:#b00020;font-weight:bold;\">Session FAILED: {}</p>",
             escape_html(err)
-        ));
+        )?;
     }
 
-    s.push_str(&format!("<h2 style=\"margin-bottom:4px;\">Runtime Statistics</h2>"));
-    s.push_str(&format!(
+    s.push_str("<h2 style=\"margin-bottom:4px;\">Runtime Statistics</h2>");
+    write!(
+        s,
         "<p style=\"margin-top:0;color:#555;\">Started: {}</p>",
         escape_html(&stats.started_label)
-    ));
+    )?;
 
     s.push_str("<table cellspacing=\"0\" cellpadding=\"4\" style=\"border-collapse:collapse;\">");
     let rows: &[(&str, String)] = &[
-        ("Total Duration", format!("{:.2} seconds", stats.duration_secs)),
-        ("DB Records Retrieved", stats.db_records_retrieved.to_string()),
-        ("Total Source Files Scanned", stats.total_source_files_scanned.to_string()),
+        (
+            "Total Duration",
+            format!("{:.2} seconds", stats.duration_secs),
+        ),
+        (
+            "DB Records Retrieved",
+            stats.db_records_retrieved.to_string(),
+        ),
+        (
+            "Total Source Files Scanned",
+            stats.total_source_files_scanned.to_string(),
+        ),
         ("Total Files Matched", stats.total_files_matched.to_string()),
-        ("Total Files Archived", stats.total_files_archived.to_string()),
+        (
+            "Total Files Archived",
+            stats.total_files_archived.to_string(),
+        ),
         ("Total Files Deleted", stats.total_files_deleted.to_string()),
         ("Errors", stats.errors.to_string()),
     ];
     for (label, value) in rows {
-        s.push_str(&format!(
+        write!(
+            s,
             "<tr><td style=\"color:#555;padding-right:16px;\">{}</td><td style=\"font-weight:bold;\">{}</td></tr>",
             escape_html(label),
             escape_html(value)
-        ));
+        )?;
     }
     s.push_str("</table>");
 
-    // Archives breakdown
     s.push_str("<h3 style=\"margin-bottom:4px;\">Archives Breakdown</h3>");
     if stats.archive_breakdown.is_empty() {
         s.push_str("<p style=\"color:#555;\">No volumes were touched this run.</p>");
@@ -266,52 +283,57 @@ fn render_with_caps(stats: &SessionStats, row_cap: usize, unmatched_cap: usize) 
              </tr>",
         );
         for row in stats.archive_breakdown.iter().take(row_cap) {
-            s.push_str(&format!(
+            write!(
+                s,
                 "<tr><td style=\"border:1px solid #ddd;\">{}</td><td style=\"text-align:right;border:1px solid #ddd;\">{}</td><td style=\"text-align:right;border:1px solid #ddd;\">{}</td></tr>",
                 escape_html(&row.volume_name),
                 row.files_archived,
                 format_bytes(row.total_bytes)
-            ));
+            )?;
         }
         s.push_str("</table>");
         if stats.archive_breakdown.len() > row_cap {
-            s.push_str(&format!(
+            write!(
+                s,
                 "<p style=\"color:#555;\">... and {} more volume(s) not shown (see the app for the full list).</p>",
                 stats.archive_breakdown.len() - row_cap
-            ));
+            )?;
         }
     }
 
-    // Unmatched barcodes
     s.push_str("<h3 style=\"margin-bottom:4px;\">Unmatched Barcodes</h3>");
     if stats.unmatched_barcodes.is_empty() {
-        s.push_str("<p style=\"color:#555;\">None — every DB candidate had at least one matching file.</p>");
+        s.push_str(
+            "<p style=\"color:#555;\">None — every DB candidate had at least one matching file.</p>",
+        );
     } else {
-        s.push_str(&format!(
+        write!(
+            s,
             "<p style=\"color:#555;margin-bottom:4px;\">{} barcode(s) had no matching file in any configured subfolder this run.</p>",
             stats.unmatched_barcodes.len()
-        ));
+        )?;
         if unmatched_cap > 0 {
             s.push_str("<p style=\"font-family:Consolas,monospace;word-break:break-all;\">");
             let shown: Vec<&str> = stats
                 .unmatched_barcodes
                 .iter()
                 .take(unmatched_cap)
-                .map(|b| b.as_str())
+                .map(String::as_str)
                 .collect();
             s.push_str(&escape_html(&shown.join(", ")));
             s.push_str("</p>");
         }
         if stats.unmatched_barcodes.len() > unmatched_cap {
-            s.push_str(&format!(
+            write!(
+                s,
                 "<p style=\"color:#555;\">... and {} more not shown (see the app for the full list).</p>",
                 stats.unmatched_barcodes.len() - unmatched_cap
-            ));
+            )?;
         }
     }
 
     s.push_str("</body></html>");
-    s
+    Ok(())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -337,7 +359,6 @@ fn escape_html(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-// regression tests for the HTML report renderer
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,7 +392,11 @@ mod tests {
             .collect();
 
         let html = render_html(&stats);
-        assert!(html.len() < MAX_BODY_BYTES + 200, "body was {} bytes", html.len());
+        assert!(
+            html.len() < MAX_BODY_BYTES + 200,
+            "body was {} bytes",
+            html.len()
+        );
         assert!(html.starts_with("<html>"));
     }
 

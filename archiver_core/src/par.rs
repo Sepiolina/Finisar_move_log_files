@@ -55,7 +55,7 @@ where
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let mut parts: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
+    let parts: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 s.spawn(|| {
@@ -84,7 +84,7 @@ where
             .collect()
     });
     tick(items.len());
-    let mut out: Vec<(usize, R)> = parts.drain(..).flatten().collect();
+    let mut out: Vec<(usize, R)> = parts.into_iter().flatten().collect();
     out.sort_unstable_by_key(|(i, _)| *i);
     out.into_iter().map(|(_, r)| r).collect()
 }
