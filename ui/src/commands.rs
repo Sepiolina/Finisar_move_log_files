@@ -22,8 +22,8 @@ use tauri::{AppHandle, State};
 const PREVIEW_MAX_BYTES: u64 = 512 * 1024;
 
 pub struct AppState {
-    pub settings: Mutex<UiSettings>,
-    pub secure_paths: SecureConfigPaths,
+    settings: Mutex<UiSettings>,
+    secure_paths: SecureConfigPaths,
     busy: AtomicBool,
 }
 

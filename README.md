@@ -8,7 +8,7 @@ monthly [MOCHI](https://github.com/immerh8/MOCHI) archives
 file's archive path, content hash and commit in a local SQLite
 database for fast later retrieval.
 
-- **69 automated tests** in `archiver_core` (`src/` inline tests +
+- **71 automated tests** in `archiver_core` (`src/` inline tests +
   `tests/*.rs` integration tests), plus 2 in the `ui` crate.
 - Built for **200,000–300,000+ small files per run**: work is spread over
   worker threads and every step is linear in the file count (see
@@ -618,10 +618,9 @@ MOCHI errors (`Mochi { code, message }` carrying the stable MOCHI code,
 plus dedicated `ArchiveLocked` for `LOCK_CONFLICT` and `UncommittedTail`
 for `UNCOMMITTED_TAIL`), post-commit `VerificationFailed`, an
 incompatible-index `SchemaMismatch`, an `UnsafePath` rejection,
-SQLite errors, SQL Server errors, configuration errors, a duplicate-scan
-case, a "no matching entry found" case for extraction, and email-relay
-errors. `From` impls
-exist for `rusqlite::Error` and `tiberius::error::Error` so `?`
+SQLite errors, SQL Server errors, configuration errors, a "no matching
+entry found" case for extraction, and email-relay errors. `#[from]`
+conversions exist for `rusqlite::Error` and `tiberius::error::Error` so `?`
 propagates cleanly from either driver. A single `Result<T>` alias is
 used as the return type throughout the crate.
 
@@ -658,9 +657,19 @@ used as the return type throughout the crate.
 | `src/session.rs` (inline) | Manifest round trip, truncated-line tolerance, orphaned-session-id recovery | 3 |
 | `tests/large_batch_integrity.rs` | Staging never overwrites, a failing month keeps its files and does not block the others (then resumes), append verified against the previous head (wrong anchor and changed file fail), file-count commit bound + streamed big file | 4 |
 | `src/par.rs` (inline) | Worker pool order and progress | 1 |
-| **Total (`archiver_core`)** | | **69** |
+| `src/matcher.rs` (inline) | Whole-char boundary checks, extension edge cases | 2 |
+| **Total (`archiver_core`)** | | **71** |
 
 `ui` has 2 further settings tests.
+
+### Checks to run before pushing
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+CI runs both on every push and pull request.
 
 > **Note:** SQL Server connectivity (`db.rs`'s live connection path)
 > is compile-verified only — no reachable SQL Server instance exists

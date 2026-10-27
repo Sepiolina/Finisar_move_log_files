@@ -1,8 +1,7 @@
 use crate::error::{ArchiveError, Result};
 use rusqlite::Connection;
 
-pub const SCHEMA_SQL: &str =
-    r#"
+pub const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS scan_session (
@@ -69,10 +68,9 @@ pub const SCHEMA_VERSION: i64 = 2;
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
+    // Column 1 of `PRAGMA table_info` is the column name.
+    for name in stmt.query_map([], |row| row.get::<_, String>(1))? {
+        if name? == column {
             return Ok(true);
         }
     }

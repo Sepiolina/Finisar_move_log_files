@@ -4,7 +4,7 @@
 //! the matching node of its execution-flow diagram.
 
 use archiver_core::db::{self, DbConfig};
-use archiver_core::email_report::{self, ArchiveBreakdownRow, EmailConfig, SessionStats};
+use archiver_core::email_report::{self, EmailConfig, SessionStats};
 use archiver_core::matcher::{has_matching_extension, BarcodeMatcher};
 use archiver_core::repo;
 use archiver_core::schema::open_and_migrate;
@@ -45,13 +45,11 @@ impl Reporter {
 
 /// Maps `archiver_core` progress messages onto flow steps.
 fn step_for(message: &str) -> Option<&'static str> {
-    const RULES: [(&str, &str); 9] = [
+    const RULES: [(&str, &str); 7] = [
         ("Checking candidates", "scan"),
         ("Building search index", "scan"),
-        ("Scanning subfolder", "scan"),
         ("Recorded ", "stage"),
         ("Staging file", "stage"),
-        ("Preparing file", "archive"),
         ("Committing", "archive"),
         ("Verifying", "archive"),
         ("Cleaning up staging", "cleanup"),
@@ -132,46 +130,36 @@ pub async fn run(input: RunInput, r: Reporter) -> Result<RunResult, String> {
     let duration_secs = started.elapsed().as_secs_f64();
 
     r.step("report", "Preparing report...");
-    let mut stats = SessionStats {
-        started_label,
-        duration_secs,
-        db_records_retrieved,
-        total_source_files_scanned: 0,
-        total_files_matched: 0,
-        total_files_archived: 0,
-        total_files_deleted: 0,
-        archive_breakdown: Vec::new(),
-        unmatched_barcodes: Vec::new(),
-        errors: 0,
-        failed: None,
-    };
-    let result = match session_run {
-        Ok(result) => result,
-        Err(e) => {
-            stats.failed = Some(e.to_string());
-            send_email(input.email.as_ref(), &stats, &r).await;
-            return Err(e.to_string());
-        }
-    };
-    stats.total_source_files_scanned = result.total_files_scanned;
-    stats.total_files_matched = result.barcodes_matched;
-    stats.total_files_archived = result.files_moved;
-    stats.total_files_deleted = result.files_deleted;
-    stats.unmatched_barcodes = result.unmatched_barcodes.clone();
-    stats.errors = result.errors;
-    stats.archive_breakdown = result
-        .archive_breakdown
-        .iter()
-        .map(|v| ArchiveBreakdownRow {
-            volume_name: v.volume_name.clone(),
-            files_archived: v.files_archived,
-            total_bytes: v.total_bytes,
-        })
-        .collect();
+    let stats = session_stats(started_label, duration_secs, db_records_retrieved, &session_run);
     send_email(input.email.as_ref(), &stats, &r).await;
+    let result = session_run.map_err(|e| e.to_string())?;
     r.log("Done.");
 
     Ok(RunResult::Archive { result, db_records_retrieved, duration_secs, scan_to_date: to_date })
+}
+
+/// Email statistics for a finished (or failed) session; counts are zero on failure.
+fn session_stats(
+    started_label: String,
+    duration_secs: f64,
+    db_records_retrieved: usize,
+    run: &archiver_core::Result<SessionResult>,
+) -> SessionStats {
+    let ok = run.as_ref().ok();
+    let count = |f: fn(&SessionResult) -> usize| ok.map_or(0, f);
+    SessionStats {
+        started_label,
+        duration_secs,
+        db_records_retrieved,
+        total_source_files_scanned: count(|r| r.total_files_scanned),
+        total_files_matched: count(|r| r.barcodes_matched),
+        total_files_archived: count(|r| r.files_moved),
+        total_files_deleted: count(|r| r.files_deleted),
+        archive_breakdown: ok.map(|r| r.archive_breakdown.clone()).unwrap_or_default(),
+        unmatched_barcodes: ok.map(|r| r.unmatched_barcodes.clone()).unwrap_or_default(),
+        errors: count(|r| r.errors),
+        failed: run.as_ref().err().map(|e| e.to_string()),
+    }
 }
 
 /// Dry run: reports which files would be archived without touching anything.

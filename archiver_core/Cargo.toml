@@ -3,8 +3,6 @@ name = "archiver_core"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "e7902607653c65f558f5b4ab16ce65961734139a" }
 blake3 = { version = "1", default-features = false, features = ["std"] }

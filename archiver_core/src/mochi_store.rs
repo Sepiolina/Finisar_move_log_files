@@ -51,17 +51,17 @@ use mochi_core::job::{CancellationToken, JobContext, NullProgress};
 use mochi_core::manifest::{Attributes, Mtime};
 use mochi_core::object::OsIds;
 use mochi_core::publish::{
-    open_head, ArchiveWriter, FileSource, PublishDurability, ReadOptions, TailRepair, Transaction,
-    WriterOptions,
+    open_head, ArchiveWriter, CommitOutcome, FileSource, OpenedHead, PublishDurability,
+    ReadOptions, TailRepair, Transaction, WriterOptions,
 };
 use mochi_core::status::{Status, VerificationLevel};
-use mochi_core::storage::os::{OsDir, OsFile, OsReadStorage};
+use mochi_core::storage::os::{OsDir, OsFile, OsReadStorage, OsStorage};
 use mochi_core::verify::{self, VerifiedHead, VerifyOptions};
 use mochi_core::{ErrorCode, MochiError};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Upper bound on the file bytes in one commit (1 GiB). Content is streamed,
@@ -121,7 +121,7 @@ pub struct StoredEntry {
 }
 
 /// Result of writing one month's files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FinishedVolume {
     pub path: PathBuf,
     /// Size of the archive file after the last commit.
@@ -155,17 +155,44 @@ pub fn volume_path(output_dir: &Path, volume_name: &str) -> PathBuf {
 
 /// Streaming BLAKE3 of a file on disk, lowercase hex.
 pub fn hash_file(path: &Path) -> Result<String> {
-    let mut f = fs::File::open(path).map_err(|e| ArchiveError::io(path, e))?;
+    let f = fs::File::open(path).map_err(|e| ArchiveError::io(path, e))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf).map_err(|e| ArchiveError::io(path, e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    hasher
+        .update_reader(std::io::BufReader::with_capacity(256 * 1024, f))
+        .map_err(|e| ArchiveError::io(path, e))?;
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Runs `f` with a job context that reports no progress and is never
+/// cancelled.
+pub(crate) fn with_job_ctx<T>(f: impl FnOnce(&JobContext<'_>) -> T) -> T {
+    let cancel = CancellationToken::new();
+    f(&JobContext {
+        progress: &NullProgress,
+        cancel: &cancel,
+    })
+}
+
+/// Opens the archive at `path` read-only, without opening its head.
+fn open_storage(path: &Path) -> Result<OsReadStorage> {
+    OsReadStorage::open(path).map_err(|e| ArchiveError::from_mochi(path, MochiError::from(e)))
+}
+
+/// Opens the archive at `path` read-only, together with its verified head.
+pub(crate) fn open_read(path: &Path) -> Result<(OsReadStorage, OpenedHead)> {
+    let src = open_storage(path)?;
+    let head =
+        open_head(&src, &ReadOptions::default()).map_err(|e| ArchiveError::from_mochi(path, e))?;
+    Ok((src, head))
+}
+
+/// The identity of an opened head.
+pub(crate) fn verified_head(head: &OpenedHead) -> VerifiedHead {
+    VerifiedHead {
+        archive_id: head.commit.archive_id,
+        seq: head.seq(),
+        commit_id: head.commit_id,
+    }
 }
 
 /// Builds an [`ArchivePath`] from a `/`-separated relative path.
@@ -175,7 +202,11 @@ pub fn archive_path_of(relative_path: &str) -> Result<ArchivePath> {
 }
 
 fn mtime_of(meta: &fs::Metadata) -> Option<Mtime> {
-    let d = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let d = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
     Some(Mtime {
         secs: i64::try_from(d.as_secs()).ok()?,
         nanos: d.subsec_nanos(),
@@ -184,7 +215,11 @@ fn mtime_of(meta: &fs::Metadata) -> Option<Mtime> {
 
 /// Content hash (hex) and length of the file at `path` in `snapshot`, or
 /// `None` if it is absent or not a regular file.
-fn stored_file(cat: &Catalog, snapshot: &Snapshot, path: &ArchivePath) -> std::result::Result<Option<(String, u64)>, MochiError> {
+fn stored_file(
+    cat: &Catalog,
+    snapshot: &Snapshot,
+    path: &ArchivePath,
+) -> std::result::Result<Option<(String, u64)>, MochiError> {
     let Some(entry) = snapshot.get(path) else {
         return Ok(None);
     };
@@ -250,17 +285,9 @@ impl<'a> Batcher<'a> {
         let mut puts = 0usize;
         while self.next < self.files.len() {
             let file = &self.files[self.next];
-            let meta = match fs::metadata(&file.staged_path) {
-                Ok(m) if m.is_file() => m,
-                Ok(_) => {
-                    self.next += 1;
-                    continue;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    self.next += 1;
-                    continue;
-                }
-                Err(e) => return Err(ArchiveError::io(&file.staged_path, e)),
+            let Some(meta) = staged_metadata(file)? else {
+                self.next += 1;
+                continue;
             };
             let size_on_disk = meta.len();
             let path = archive_path_of(&file.relative_path)?;
@@ -287,23 +314,15 @@ impl<'a> Batcher<'a> {
             }
 
             if puts > 0
-                && (puts >= self.file_budget || used.saturating_add(size_on_disk) > self.byte_budget)
+                && (puts >= self.file_budget
+                    || used.saturating_add(size_on_disk) > self.byte_budget)
             {
                 break;
             }
 
-            // Explicit directory entries for every ancestor not yet present.
-            let mut missing: Vec<ArchivePath> = Vec::new();
-            let mut cur = path.parent();
-            while let Some(dir) = cur {
-                let in_head = self.head.as_ref().is_some_and(|h| h.get(&dir).is_some());
-                if in_head || self.dirs_done.contains(&dir) {
-                    break;
-                }
-                cur = dir.parent();
-                missing.push(dir);
-            }
-            for dir in missing.into_iter().rev() {
+            // Explicit directory entries for every ancestor not yet present,
+            // outermost first.
+            for dir in self.missing_dirs(&path).into_iter().rev() {
                 tx.put_dir(dir.clone(), Attributes::default());
                 self.dirs_done.insert(dir);
             }
@@ -336,6 +355,41 @@ impl<'a> Batcher<'a> {
             Ok(Some(Batch { tx, entries }))
         }
     }
+
+    /// The ancestors of `path` that are neither in the head nor put by an
+    /// earlier batch, innermost first.
+    fn missing_dirs(&self, path: &ArchivePath) -> Vec<ArchivePath> {
+        let mut missing = Vec::new();
+        let mut cur = path.parent();
+        while let Some(dir) = cur {
+            let in_head = self.head.as_ref().is_some_and(|h| h.get(&dir).is_some());
+            if in_head || self.dirs_done.contains(&dir) {
+                break;
+            }
+            cur = dir.parent();
+            missing.push(dir);
+        }
+        missing
+    }
+
+    /// Starts over from the first file, e.g. after the batch that would have
+    /// created the archive was consumed by a lost creation race: its
+    /// directories must be put again.
+    fn restart(&mut self) {
+        self.next = 0;
+        self.dirs_done.clear();
+    }
+}
+
+/// Metadata of a staged file, or `None` if it vanished or is not a regular
+/// file (such files are skipped).
+fn staged_metadata(file: &StoreFile) -> Result<Option<fs::Metadata>> {
+    match fs::metadata(&file.staged_path) {
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ArchiveError::io(&file.staged_path, e)),
+    }
 }
 
 /// Writes `files` into the month's archive at `archive_path`, creating it if
@@ -362,7 +416,11 @@ pub fn store_volume_with_budget(
 }
 
 /// [`store_volume`] with explicit commit budgets and worker count.
-pub fn store_volume_with(archive_path: &Path, files: &[StoreFile], store: &StoreOptions) -> Result<FinishedVolume> {
+pub fn store_volume_with(
+    archive_path: &Path,
+    files: &[StoreFile],
+    store: &StoreOptions,
+) -> Result<FinishedVolume> {
     let map = |e: MochiError| ArchiveError::from_mochi(archive_path, e);
 
     if let Some(parent) = archive_path.parent() {
@@ -372,129 +430,203 @@ pub fn store_volume_with(archive_path: &Path, files: &[StoreFile], store: &Store
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
-            ArchiveError::Config(format!("archive path {archive_path:?} has no usable file name"))
+            ArchiveError::Config(format!(
+                "archive path {archive_path:?} has no usable file name"
+            ))
         })?;
-
-    let progress = NullProgress;
-    let cancel = CancellationToken::new();
-    let ctx = JobContext {
-        progress: &progress,
-        cancel: &cancel,
-    };
     // MOCHI 0.9.11 compresses on worker threads; give it this month's share
     // of the workers (several months may be written at once).
     let threads = par::worker_count(store.workers);
-    let opts = || WriterOptions {
+    let mut dir = OsDir::containing(archive_path).map_err(|e| map(MochiError::from(e)))?;
+    let mut batcher = Batcher::new(files, store);
+    let mut commits = Commits::default();
+
+    with_job_ctx(|ctx| {
+        let Some(OpenedWriter {
+            mut writer,
+            created,
+            prior_head,
+        }) = open_or_create_writer(
+            archive_path,
+            &mut dir,
+            name,
+            threads,
+            &mut batcher,
+            &mut commits,
+            ctx,
+        )?
+        else {
+            // Nothing to store and nothing to create.
+            return Ok(FinishedVolume {
+                path: archive_path.to_path_buf(),
+                ..FinishedVolume::default()
+            });
+        };
+
+        // One replay for the whole call (see the module docs).
+        batcher.head = Some(writer.catalog().replay(None).map_err(map)?);
+        while let Some(Batch { tx, entries }) = batcher.next_batch(Some(writer.catalog()))? {
+            if tx.is_empty() {
+                // Everything in this batch is already committed with identical
+                // bytes; no new commit. Index it at the current head.
+                let seq = writer
+                    .head_seq()
+                    .ok_or_else(|| ArchiveError::Config("archive has no head".into()))?;
+                commits.unchanged(entries, seq);
+            } else {
+                let outcome = writer.commit(tx, ctx).map_err(map)?;
+                commits.committed(entries, &outcome);
+            }
+        }
+
+        let written = read_back_entries(archive_path, writer.catalog(), commits.pending)?;
+        let head_seq = writer
+            .head_seq()
+            .ok_or_else(|| ArchiveError::Config("archive has no head after commit".into()))?;
+        let head_commit_id = writer
+            .head_commit_id()
+            .map(|c| c.to_hex())
+            .unwrap_or_default();
+        writer.close().map_err(map)?;
+
+        let file_size = fs::metadata(archive_path)
+            .map_err(|e| ArchiveError::io(archive_path, e))?
+            .len();
+        Ok(FinishedVolume {
+            path: archive_path.to_path_buf(),
+            file_size,
+            entry_count: written.len(),
+            head_commit_id,
+            head_seq,
+            written_entries: written,
+            commit_seqs: commits.seqs,
+            created,
+            degraded_durability: commits.degraded,
+            prior_head,
+        })
+    })
+}
+
+fn writer_options(threads: usize) -> WriterOptions {
+    WriterOptions {
         record_time: true,
         threads: Some(threads),
         ..WriterOptions::default()
-    };
-    let mut dir = OsDir::containing(archive_path).map_err(|e| map(MochiError::from(e)))?;
-
-    let mut batcher = Batcher::new(files, store);
-    // (entry, commit seq), hashes filled in at the end.
-    let mut pending: Vec<(PendingEntry, u64)> = Vec::new();
-    let mut commit_seqs: Vec<u64> = Vec::new();
-    let mut created = false;
-    let mut prior_head: Option<VerifiedHead> = None;
-    let mut degraded: Option<String> = None;
-    let note = |d: &PublishDurability, degraded: &mut Option<String>| {
-        if let PublishDurability::DirectoryUnconfirmed(why) = d {
-            degraded.get_or_insert_with(|| why.clone());
-        }
-    };
-
-    // Open (or create) the writer, committing the first batch on the way.
-    let mut writer = if archive_path.exists() {
-        None
-    } else {
-        match batcher.next_batch(None)? {
-            None => {
-                // Nothing to store and nothing to create.
-                return Ok(FinishedVolume {
-                    path: archive_path.to_path_buf(),
-                    file_size: 0,
-                    entry_count: 0,
-                    head_commit_id: String::new(),
-                    head_seq: 0,
-                    written_entries: Vec::new(),
-                    commit_seqs: Vec::new(),
-                    created: false,
-                    degraded_durability: None,
-                    prior_head: None,
-                });
-            }
-            Some(first) => {
-                let Batch { tx, entries } = first;
-                match ArchiveWriter::create_in(&mut dir, name, Box::new(OsIds), opts(), tx, &ctx) {
-                    Ok((w, outcome)) => {
-                        created = true;
-                        note(&outcome.durability, &mut degraded);
-                        pending.extend(entries.into_iter().map(|e| (e, outcome.seq)));
-                        commit_seqs.push(outcome.seq);
-                        Some(w)
-                    }
-                    // Lost a race with another creator: the archive exists now.
-                    // The consumed batch's dirs must be re-put when re-batched.
-                    Err(e) if e.code == ErrorCode::DestinationExists => {
-                        batcher.next = 0;
-                        batcher.dirs_done.clear();
-                        None
-                    }
-                    Err(e) => return Err(map(e)),
-                }
-            }
-        }
-    };
-    if writer.is_none() {
-        let (w, _) = ArchiveWriter::open_append_in(&mut dir, name, Box::new(OsIds), opts(), TailRepair::Refuse)
-            .map_err(map)?;
-        if let (Some(seq), Some(commit_id)) = (w.head_seq(), w.head_commit_id()) {
-            prior_head = Some(VerifiedHead {
-                archive_id: w.archive_id(),
-                seq,
-                commit_id,
-            });
-        }
-        writer = Some(w);
     }
-    let mut writer = writer.ok_or_else(|| ArchiveError::Config("writer was not opened".into()))?;
+}
 
-    // One replay for the whole call (see the module docs).
-    batcher.head = Some(writer.catalog().replay(None).map_err(map)?);
-    loop {
-        let Some(batch) = batcher.next_batch(Some(writer.catalog()))? else {
-            break;
+/// What this call's batches produced so far.
+#[derive(Default)]
+struct Commits {
+    /// (entry, commit seq); the hashes are read back after the last commit.
+    pending: Vec<(PendingEntry, u64)>,
+    /// Sequence numbers of the commits made, in order.
+    seqs: Vec<u64>,
+    /// The first reason a commit's directory entry was not confirmed durable.
+    degraded: Option<String>,
+}
+
+impl Commits {
+    /// `entries` were committed as `outcome`.
+    fn committed(&mut self, entries: Vec<PendingEntry>, outcome: &CommitOutcome) {
+        if let PublishDurability::DirectoryUnconfirmed(why) = &outcome.durability {
+            self.degraded.get_or_insert_with(|| why.clone());
+        }
+        self.pending
+            .extend(entries.into_iter().map(|e| (e, outcome.seq)));
+        self.seqs.push(outcome.seq);
+    }
+
+    /// `entries` are already in the head at `seq`; no commit was made.
+    fn unchanged(&mut self, entries: Vec<PendingEntry>, seq: u64) {
+        self.pending.extend(entries.into_iter().map(|e| (e, seq)));
+    }
+}
+
+struct OpenedWriter {
+    writer: ArchiveWriter<OsStorage>,
+    /// `true` if this call created the archive.
+    created: bool,
+    /// The head before this call's first commit (`None` if created now).
+    prior_head: Option<VerifiedHead>,
+}
+
+/// Opens the archive for append or, if it is missing, creates it with the
+/// first batch as its first commit. `None`: the archive is missing and there
+/// is nothing to store, so nothing was created.
+fn open_or_create_writer(
+    archive_path: &Path,
+    dir: &mut OsDir,
+    name: &str,
+    threads: usize,
+    batcher: &mut Batcher<'_>,
+    commits: &mut Commits,
+    ctx: &JobContext<'_>,
+) -> Result<Option<OpenedWriter>> {
+    let map = |e: MochiError| ArchiveError::from_mochi(archive_path, e);
+
+    if !archive_path.exists() {
+        let Some(Batch { tx, entries }) = batcher.next_batch(None)? else {
+            return Ok(None);
         };
-        let Batch { tx, entries } = batch;
-        if tx.is_empty() {
-            // Everything in this batch is already committed with identical
-            // bytes; no new commit. Index it at the current head.
-            let seq = writer
-                .head_seq()
-                .ok_or_else(|| ArchiveError::Config("archive has no head".into()))?;
-            pending.extend(entries.into_iter().map(|e| (e, seq)));
-            continue;
+        // `create_in` never replaces an existing file.
+        let options = writer_options(threads);
+        match ArchiveWriter::create_in(dir, name, Box::new(OsIds), options, tx, ctx) {
+            Ok((writer, outcome)) => {
+                commits.committed(entries, &outcome);
+                return Ok(Some(OpenedWriter {
+                    writer,
+                    created: true,
+                    prior_head: None,
+                }));
+            }
+            // Lost a race with another creator: the archive exists now; append.
+            Err(e) if e.code == ErrorCode::DestinationExists => batcher.restart(),
+            Err(e) => return Err(map(e)),
         }
-        let outcome = writer.commit(tx, &ctx).map_err(map)?;
-        note(&outcome.durability, &mut degraded);
-        pending.extend(entries.into_iter().map(|e| (e, outcome.seq)));
-        commit_seqs.push(outcome.seq);
     }
 
-    // The hashes MOCHI computed while it streamed each file, and the lengths
-    // it actually read.
-    let head = writer.catalog().replay(None).map_err(map)?;
-    let mut written: Vec<StoredEntry> = Vec::with_capacity(pending.len());
+    let options = writer_options(threads);
+    let (writer, _) =
+        ArchiveWriter::open_append_in(dir, name, Box::new(OsIds), options, TailRepair::Refuse)
+            .map_err(map)?;
+    let prior_head = match (writer.head_seq(), writer.head_commit_id()) {
+        (Some(seq), Some(commit_id)) => Some(VerifiedHead {
+            archive_id: writer.archive_id(),
+            seq,
+            commit_id,
+        }),
+        _ => None,
+    };
+    Ok(Some(OpenedWriter {
+        writer,
+        created: false,
+        prior_head,
+    }))
+}
+
+/// The committed entries with the hashes MOCHI computed while it streamed
+/// each file, and the lengths it actually read (one replay of the head).
+fn read_back_entries(
+    archive_path: &Path,
+    cat: &Catalog,
+    pending: Vec<(PendingEntry, u64)>,
+) -> Result<Vec<StoredEntry>> {
+    let map = |e: MochiError| ArchiveError::from_mochi(archive_path, e);
+    let head = cat.replay(None).map_err(map)?;
+    let mut written = Vec::with_capacity(pending.len());
     for (e, seq) in pending {
         let (content_hash, size) = match e.content_hash {
             Some(h) if e.skipped => (h, e.size),
-            _ => stored_file(writer.catalog(), &head, &e.path)
+            _ => stored_file(cat, &head, &e.path)
                 .map_err(map)?
                 .ok_or_else(|| {
                     verification_failed(
                         archive_path,
-                        format!("{} is not a file in the head after its commit", e.relative_path),
+                        format!(
+                            "{} is not a file in the head after its commit",
+                            e.relative_path
+                        ),
                     )
                 })?,
         };
@@ -505,45 +637,7 @@ pub fn store_volume_with(archive_path: &Path, files: &[StoreFile], store: &Store
             commit_seq: seq,
         });
     }
-    drop(head);
-
-    let head_seq = writer
-        .head_seq()
-        .ok_or_else(|| ArchiveError::Config("archive has no head after commit".into()))?;
-    let head_commit_id = writer
-        .head_commit_id()
-        .map(|c| c.to_hex())
-        .unwrap_or_default();
-    writer.close().map_err(map)?;
-
-    let file_size = fs::metadata(archive_path)
-        .map_err(|e| ArchiveError::io(archive_path, e))?
-        .len();
-    Ok(FinishedVolume {
-        path: archive_path.to_path_buf(),
-        file_size,
-        entry_count: written.len(),
-        head_commit_id,
-        head_seq,
-        written_entries: written,
-        commit_seqs,
-        created,
-        degraded_durability: degraded,
-        prior_head,
-    })
-}
-
-/// A `Write` sink that BLAKE3-hashes what it receives.
-struct HashSink(blake3::Hasher);
-
-impl std::io::Write for HashSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    Ok(written)
 }
 
 fn verification_failed(volume: &Path, reason: impl Into<String>) -> ArchiveError {
@@ -577,14 +671,13 @@ pub fn verify_volume_with(
     files: &[StoreFile],
     since: Option<&VerifiedHead>,
     workers: usize,
-    on_progress: impl FnMut(usize),
+    mut on_progress: impl FnMut(usize),
 ) -> Result<VerifiedHead> {
-    let map = |e: MochiError| ArchiveError::from_mochi(archive_path, e);
-    let progress = NullProgress;
-    let cancel = CancellationToken::new();
-    let ctx = JobContext {
-        progress: &progress,
-        cancel: &cancel,
+    let changed = || {
+        verification_failed(
+            archive_path,
+            "the archive head changed while it was verified",
+        )
     };
 
     // Per-file checks, in contiguous slices; every worker opens its own
@@ -594,46 +687,45 @@ pub fn verify_volume_with(
         .min(files.len().div_ceil(MIN_FILES_PER_VERIFY_WORKER))
         .max(1);
     let slices: Vec<&[StoreFile]> = files.chunks(files.len().div_ceil(workers).max(1)).collect();
-    let checked = std::sync::atomic::AtomicUsize::new(0);
-    let mut on_progress = on_progress;
+    let checked = AtomicUsize::new(0);
     let results = par::map(
         &slices,
         workers,
         |slice| verify_files(archive_path, slice, &checked),
-        |_| on_progress(checked.load(std::sync::atomic::Ordering::Relaxed)),
+        |_| on_progress(checked.load(Ordering::Relaxed)),
     );
+    // Every slice must have seen the same head.
     let mut head: Option<VerifiedHead> = None;
     for r in results {
         let h = r?;
         if head.is_some_and(|prev| prev != h) {
-            return Err(verification_failed(archive_path, "the archive head changed while it was verified"));
+            return Err(changed());
         }
         head = Some(h);
     }
 
-    let src = OsReadStorage::open(archive_path).map_err(|e| map(MochiError::from(e)))?;
+    let src = open_storage(archive_path)?;
     let ro = ReadOptions::default();
     // The head the per-file checks saw (opening a big archive's head costs
     // seconds, so it is not opened again just to learn it).
     let current = match head {
         Some(h) => h,
-        None => {
-            let opened = open_head(&src, &ro).map_err(map)?;
-            VerifiedHead {
-                archive_id: opened.commit.archive_id,
-                seq: opened.seq(),
-                commit_id: opened.commit_id,
-            }
-        }
+        None => verified_head(
+            &open_head(&src, &ro).map_err(|e| ArchiveError::from_mochi(archive_path, e))?,
+        ),
     };
-    let changed = || verification_failed(archive_path, "the archive head changed while it was verified");
 
-    match since {
-        Some(prev) if *prev == current => {} // nothing new to check structurally
+    with_job_ctx(|ctx| match since {
+        Some(prev) if *prev == current => Ok(current), // nothing new to check structurally
         Some(prev) => {
-            let scoped = verify::verify_commits_since(&src, &ro, prev, &ctx);
+            let scoped = verify::verify_commits_since(&src, &ro, prev, ctx);
             if scoped.scope_status() != Status::Pass {
-                let findings: Vec<String> = scoped.findings.iter().take(5).map(|f| format!("{f:?}")).collect();
+                let findings: Vec<String> = scoped
+                    .findings
+                    .iter()
+                    .take(5)
+                    .map(|f| format!("{f:?}"))
+                    .collect();
                 return Err(verification_failed(
                     archive_path,
                     format!(
@@ -653,81 +745,94 @@ pub fn verify_volume_with(
             if scoped.head != Some(current) {
                 return Err(changed());
             }
+            Ok(current)
         }
         None => {
-            if verify_whole(archive_path, &src, &ctx)? != Some(current) {
+            if verify_whole(archive_path, &src, ctx)? != Some(current) {
                 return Err(changed());
             }
+            Ok(current)
         }
-    }
-    Ok(current)
+    })
 }
 
 /// Present in the head with the staged file's hash, and read back intact.
 fn verify_files(
     archive_path: &Path,
     files: &[StoreFile],
-    checked: &std::sync::atomic::AtomicUsize,
+    checked: &AtomicUsize,
 ) -> Result<VerifiedHead> {
     let map = |e: MochiError| ArchiveError::from_mochi(archive_path, e);
-    let src = OsReadStorage::open(archive_path).map_err(|e| map(MochiError::from(e)))?;
-    let ro = ReadOptions::default();
-    let head = open_head(&src, &ro).map_err(map)?;
+    let (src, head) = open_read(archive_path)?;
     let snapshot = head.catalog.replay(None).map_err(map)?;
-    let progress = NullProgress;
-    let cancel = CancellationToken::new();
-    let ctx = JobContext {
-        progress: &progress,
-        cancel: &cancel,
-    };
+    let ro = ReadOptions::default();
 
-    for file in files {
-        let path = archive_path_of(&file.relative_path)?;
-        let entry = snapshot.get(&path).ok_or_else(|| {
-            verification_failed(archive_path, format!("{} is missing from the archive head", file.relative_path))
-        })?;
-        if entry.kind != EntryKind::File {
-            return Err(verification_failed(
-                archive_path,
-                format!("{} is not a regular file in the archive", file.relative_path),
-            ));
-        }
-        let stored_hash = stored_file(&head.catalog, &snapshot, &path).map_err(map)?.map(|(h, _)| h);
-        let staged_hash = hash_file(&file.staged_path)?;
-        if stored_hash.as_deref() != Some(staged_hash.as_str()) {
-            return Err(verification_failed(
-                archive_path,
-                format!(
-                    "{}: archive content hash {} does not match staged file hash {staged_hash}",
-                    file.relative_path,
-                    stored_hash.as_deref().unwrap_or("(none)")
-                ),
-            ));
-        }
-        // End-to-end verified read of the stored copy (by version: no replay
-        // per file).
-        let mut sink = HashSink(blake3::Hasher::new());
-        mochi_core::read::read_version(&src, &head.catalog, &entry.version, &mut sink, &ro, &ctx)
+    with_job_ctx(|ctx| {
+        for file in files {
+            let path = archive_path_of(&file.relative_path)?;
+            let entry = snapshot.get(&path).ok_or_else(|| {
+                verification_failed(
+                    archive_path,
+                    format!("{} is missing from the archive head", file.relative_path),
+                )
+            })?;
+            if entry.kind != EntryKind::File {
+                return Err(verification_failed(
+                    archive_path,
+                    format!(
+                        "{} is not a regular file in the archive",
+                        file.relative_path
+                    ),
+                ));
+            }
+            let stored_hash = stored_file(&head.catalog, &snapshot, &path)
+                .map_err(map)?
+                .map(|(h, _)| h);
+            let staged_hash = hash_file(&file.staged_path)?;
+            if stored_hash.as_deref() != Some(staged_hash.as_str()) {
+                return Err(verification_failed(
+                    archive_path,
+                    format!(
+                        "{}: archive content hash {} does not match staged file hash {staged_hash}",
+                        file.relative_path,
+                        stored_hash.as_deref().unwrap_or("(none)")
+                    ),
+                ));
+            }
+            // End-to-end verified read of the stored copy (by version: no
+            // replay per file).
+            let mut hasher = blake3::Hasher::new();
+            mochi_core::read::read_version(
+                &src,
+                &head.catalog,
+                &entry.version,
+                &mut hasher,
+                &ro,
+                ctx,
+            )
             .map_err(map)?;
-        let read_back = sink.0.finalize().to_hex().to_string();
-        if read_back != staged_hash {
-            return Err(verification_failed(
-                archive_path,
-                format!("{}: bytes read back from the archive differ from the staged file", file.relative_path),
-            ));
+            if hasher.finalize().to_hex().as_str() != staged_hash {
+                return Err(verification_failed(
+                    archive_path,
+                    format!(
+                        "{}: bytes read back from the archive differ from the staged file",
+                        file.relative_path
+                    ),
+                ));
+            }
+            checked.fetch_add(1, Ordering::Relaxed);
         }
-        checked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(VerifiedHead {
-        archive_id: head.commit.archive_id,
-        seq: head.seq(),
-        commit_id: head.commit_id,
+        Ok(verified_head(&head))
     })
 }
 
 /// MOCHI's content-level verification of the whole archive. Returns the
 /// head it checked.
-fn verify_whole(archive_path: &Path, src: &OsReadStorage, ctx: &JobContext<'_>) -> Result<Option<VerifiedHead>> {
+fn verify_whole(
+    archive_path: &Path,
+    src: &OsReadStorage,
+    ctx: &JobContext<'_>,
+) -> Result<Option<VerifiedHead>> {
     let verification = verify::verify(
         src,
         &VerifyOptions {

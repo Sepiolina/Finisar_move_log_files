@@ -1,7 +1,8 @@
 //! SQL Server query module for fetching old barcode records for archival.
 
 use crate::error::{ArchiveError, Result};
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -64,7 +65,9 @@ impl DbConfig {
     /// Loads settings from environment variables (e.g. `DB_SERVER`, `DB_PASSWORD`), using defaults for optional ones.
     pub fn from_env() -> Result<Self> {
         fn req(key: &str) -> Result<String> {
-            std::env::var(key).map_err(|_| ArchiveError::Config(format!("missing required environment variable {key}")))
+            std::env::var(key).map_err(|_| {
+                ArchiveError::Config(format!("missing required environment variable {key}"))
+            })
         }
         fn opt_bool(key: &str, default: bool) -> bool {
             std::env::var(key)
@@ -72,27 +75,25 @@ impl DbConfig {
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(default)
         }
-        fn opt_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-        }
-        fn opt_u32(key: &str, default: u32) -> u32 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-        }
-        fn opt_u16(key: &str, default: u16) -> u16 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        /// Parsed value of `key`, or `default` if unset or unparsable.
+        fn opt<T: FromStr>(key: &str, default: T) -> T {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         }
 
         Ok(Self {
             server: req("DB_SERVER")?,
-            port: opt_u16("DB_PORT", 1433),
+            port: opt("DB_PORT", 1433),
             database: req("DB_NAME")?,
             username: req("DB_USER")?,
             password: req("DB_PASSWORD")?,
             encrypt: opt_bool("DB_ENCRYPT", false),
             trust_server_certificate: opt_bool("DB_TRUST_SERVER_CERTIFICATE", true),
-            request_timeout: Duration::from_millis(opt_u64("DB_REQUEST_TIMEOUT_MS", 30_000)),
-            retry_attempts: opt_u32("DB_RETRY_ATTEMPTS", 3),
-            retry_base_delay: Duration::from_millis(opt_u64("DB_RETRY_BASE_DELAY_MS", 2_000)),
+            request_timeout: Duration::from_millis(opt("DB_REQUEST_TIMEOUT_MS", 30_000)),
+            retry_attempts: opt("DB_RETRY_ATTEMPTS", 3),
+            retry_base_delay: Duration::from_millis(opt("DB_RETRY_BASE_DELAY_MS", 2_000)),
         })
     }
 
@@ -138,23 +139,21 @@ pub async fn query_archival_candidates(
     to_date: &str,
 ) -> Result<Vec<ArchivalCandidate>> {
     let sql = build_query(from_date, to_date);
-    let mut last_err = None;
 
-    for attempt in 0..=config.retry_attempts {
+    // One initial attempt plus `retry_attempts` retries; the last error wins.
+    let mut attempt = 0;
+    loop {
         match try_query_once(config, &sql).await {
             Ok(rows) => return Ok(rows),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < config.retry_attempts {
-                    // Exponential backoff delay (e.g. 2s, 4s, 8s...)
-                    let delay = config.retry_base_delay * 2u32.pow(attempt);
-                    tokio::time::sleep(delay).await;
-                }
+            Err(e) if attempt >= config.retry_attempts => return Err(e),
+            Err(_) => {
+                // Exponential backoff: base, 2*base, 4*base, ...
+                let delay = config.retry_base_delay * 2u32.pow(attempt);
+                tokio::time::sleep(delay).await;
+                attempt += 1;
             }
         }
     }
-
-    Err(last_err.expect("loop runs at least once, so an error is always set on the failure path"))
 }
 
 fn io_timeout_err(message: &str) -> ArchiveError {
@@ -175,9 +174,7 @@ fn io_connect_err(e: std::io::Error) -> ArchiveError {
 async fn try_query_once(config: &DbConfig, sql: &str) -> Result<Vec<ArchivalCandidate>> {
     let tiberius_config = config.to_tiberius_config();
 
-    let addr = tiberius_config
-        .get_addr()
-        .to_string();
+    let addr = tiberius_config.get_addr().to_string();
 
     // Establish TCP connection with timeout
     let tcp = tokio::time::timeout(config.request_timeout, TcpStream::connect(&addr))
@@ -197,7 +194,10 @@ async fn try_query_once(config: &DbConfig, sql: &str) -> Result<Vec<ArchivalCand
         .map_err(|_| io_timeout_err("query timed out"))?
         .map_err(ArchiveError::from)?;
 
-    let rows = stream.into_first_result().await.map_err(ArchiveError::from)?;
+    let rows = stream
+        .into_first_result()
+        .await
+        .map_err(ArchiveError::from)?;
 
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
@@ -215,61 +215,71 @@ async fn try_query_once(config: &DbConfig, sql: &str) -> Result<Vec<ArchivalCand
 }
 
 /// Calculates `(from_date, to_date)` strings (YYYY-MM-DD) for the scan window.
-/// Uses custom date math functions to avoid pulling in an extra date library.
+/// Uses the small civil-date helpers below instead of a date library.
 pub fn compute_resume_window(
     last_successful_scan_to_date: Option<&str>,
     lookback_days: i64,
 ) -> Result<(Option<String>, String)> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Low-level date math helper functions
-    fn days_since_epoch_now() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-            / 86_400
-    }
-    fn days_to_ymd(days: i64) -> String {
-        let z = days + 719468;
-        let era = if z >= 0 { z } else { z - 146096 } / 146097;
-        let doe = (z - era * 146097) as u64;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        format!("{y:04}-{m:02}-{d:02}")
-    }
-    fn ymd_to_days(s: &str) -> Result<i64> {
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 {
-            return Err(ArchiveError::Config(format!("invalid date string {s:?}, expected YYYY-MM-DD")));
-        }
-        let y: i64 = parts[0].parse().map_err(|_| ArchiveError::Config(format!("bad year in {s:?}")))?;
-        let m: i64 = parts[1].parse().map_err(|_| ArchiveError::Config(format!("bad month in {s:?}")))?;
-        let d: i64 = parts[2].parse().map_err(|_| ArchiveError::Config(format!("bad day in {s:?}")))?;
-        let y2 = if m <= 2 { y - 1 } else { y };
-        let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
-        let yoe = (y2 - era * 400) as u64;
-        let mp = ((m + 9) % 12) as u64;
-        let doy = (153 * mp + 2) / 5 + d as u64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        Ok(era * 146097 + doe as i64 - 719468)
-    }
-
-    let to_days = days_since_epoch_now() - lookback_days;
-    let to_date = days_to_ymd(to_days);
+    let to_date = days_to_ymd(days_since_epoch_now() - lookback_days);
 
     let from_date = match last_successful_scan_to_date {
-        Some(prev_to) => {
-            let prev_days = ymd_to_days(prev_to)?;
-            Some(days_to_ymd(prev_days - 1))
-        }
+        Some(prev_to) => Some(days_to_ymd(ymd_to_days(prev_to)? - 1)),
         None => None,
     };
 
     Ok((from_date, to_date))
+}
+
+/// Current UTC day number (days since 1970-01-01).
+fn days_since_epoch_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        / 86_400
+}
+
+// The two conversions below are Howard Hinnant's `civil_from_days` and
+// `days_from_civil` (proleptic Gregorian calendar; 400-year eras of 146_097
+// days; years counted from March so the leap day falls last).
+
+/// Day number (days since 1970-01-01) -> "YYYY-MM-DD".
+fn days_to_ymd(days: i64) -> String {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// "YYYY-MM-DD" -> day number (days since 1970-01-01).
+fn ymd_to_days(s: &str) -> Result<i64> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return Err(ArchiveError::Config(format!(
+            "invalid date string {s:?}, expected YYYY-MM-DD"
+        )));
+    }
+    let y: i64 = parts[0]
+        .parse()
+        .map_err(|_| ArchiveError::Config(format!("bad year in {s:?}")))?;
+    let m: i64 = parts[1]
+        .parse()
+        .map_err(|_| ArchiveError::Config(format!("bad month in {s:?}")))?;
+    let d: i64 = parts[2]
+        .parse()
+        .map_err(|_| ArchiveError::Config(format!("bad day in {s:?}")))?;
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = (y2 - era * 400) as u64;
+    let mp = ((m + 9) % 12) as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(era * 146097 + doe as i64 - 719468)
 }
