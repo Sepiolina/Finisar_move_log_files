@@ -1,5 +1,6 @@
 use crate::db::DbConfig;
 use crate::error::{ArchiveError, Result};
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,6 @@ fn load_or_create_key(paths: &SecureConfigPaths) -> Result<[u8; KEY_LEN]> {
     }
 
     let mut key = [0u8; KEY_LEN];
-    use aes_gcm::aead::rand_core::RngCore;
     OsRng.fill_bytes(&mut key);
 
     if let Some(parent) = paths.key_file.parent() {
@@ -62,8 +62,8 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
             .mode(0o600)
             .open(path)
             .map_err(|e| ArchiveError::io(path, e))?;
-        file.write_all(contents).map_err(|e| ArchiveError::io(path, e))?;
-        return Ok(());
+        file.write_all(contents)
+            .map_err(|e| ArchiveError::io(path, e))
     }
     #[cfg(not(unix))]
     {
@@ -71,14 +71,17 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     }
 }
 
+/// The AES-256-GCM cipher for the stored key (creating the key if absent).
+fn cipher(paths: &SecureConfigPaths) -> Result<Aes256Gcm> {
+    let key_bytes = load_or_create_key(paths)?;
+    Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes)))
+}
+
 /// Encrypts and saves `config` to disk.
 pub fn save(paths: &SecureConfigPaths, config: &DbConfig) -> Result<()> {
-    let key_bytes = load_or_create_key(paths)?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = cipher(paths)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    use aes_gcm::aead::rand_core::RngCore;
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -111,9 +114,7 @@ pub fn load(paths: &SecureConfigPaths) -> Result<Option<DbConfig>> {
         )));
     }
 
-    let key_bytes = load_or_create_key(paths)?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = cipher(paths)?;
 
     let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -132,11 +133,14 @@ pub fn load(paths: &SecureConfigPaths) -> Result<Option<DbConfig>> {
 
 /// Deletes both the encryption key and configuration file.
 pub fn clear(paths: &SecureConfigPaths) -> Result<()> {
-    if paths.config_file.exists() {
-        std::fs::remove_file(&paths.config_file).map_err(|e| ArchiveError::io(&paths.config_file, e))?;
+    remove_if_present(&paths.config_file)?;
+    remove_if_present(&paths.key_file)
+}
+
+/// Removes `path`; a file that is already gone is not an error.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ArchiveError::io(path, e)),
+        _ => Ok(()),
     }
-    if paths.key_file.exists() {
-        std::fs::remove_file(&paths.key_file).map_err(|e| ArchiveError::io(&paths.key_file, e))?;
-    }
-    Ok(())
 }
