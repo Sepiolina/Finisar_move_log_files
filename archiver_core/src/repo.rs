@@ -4,6 +4,11 @@ use crate::error::{ArchiveError, Result};
 use crate::mochi_store::FinishedVolume;
 use rusqlite::{params, Connection, OptionalExtension};
 
+// `SessionStatus` and `BarcodeStatus` mirror the `CHECK(status IN (...))`
+// constraints in `schema::SCHEMA_SQL`; some variants (`Failed`, `Error`) are
+// not written by the current code but are kept so the enums stay in sync with
+// the schema.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Running,
@@ -40,20 +45,30 @@ impl BarcodeStatus {
 
 /// Checks if a session ID exists to prevent using stale or invalid IDs.
 pub fn session_exists(conn: &Connection, session_id: i64) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM scan_session WHERE id = ?1",
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scan_session WHERE id = ?1)",
         params![session_id],
         |row| row.get(0),
-    )?;
-    Ok(count > 0)
+    )
+    .map_err(ArchiveError::from)
 }
 
 /// Creates a new scan session with status `running` and returns its ID.
-pub fn start_session(conn: &Connection, started_at: &str, query_from_date: &str, query_to_date: &str) -> Result<i64> {
+pub fn start_session(
+    conn: &Connection,
+    started_at: &str,
+    query_from_date: &str,
+    query_to_date: &str,
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO scan_session (started_at, status, query_from_date, query_to_date)
          VALUES (?1, ?2, ?3, ?4)",
-        params![started_at, SessionStatus::Running.as_str(), query_from_date, query_to_date],
+        params![
+            started_at,
+            SessionStatus::Running.as_str(),
+            query_from_date,
+            query_to_date
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -73,7 +88,14 @@ pub fn complete_session(
          SET completed_at = ?1, status = ?2, total_barcodes = ?3,
              total_files_moved = ?4, total_errors = ?5
          WHERE id = ?6",
-        params![completed_at, status.as_str(), total_barcodes, total_files_moved, total_errors, session_id],
+        params![
+            completed_at,
+            status.as_str(),
+            total_barcodes,
+            total_files_moved,
+            total_errors,
+            session_id
+        ],
     )?;
     Ok(())
 }
@@ -104,7 +126,12 @@ pub fn record_session_barcode(
             "INSERT INTO session_barcode (scan_session_id, barcode, last_update, status)
              VALUES (?1, ?2, ?3, ?4)",
         )?
-        .execute(params![scan_session_id, barcode, last_update, status.as_str()]);
+        .execute(params![
+            scan_session_id,
+            barcode,
+            last_update,
+            status.as_str()
+        ]);
 
     match result {
         Ok(_) => Ok(Some(conn.last_insert_rowid())),
@@ -118,11 +145,16 @@ pub fn record_session_barcode(
 }
 
 /// Checks if a barcode was scanned previously (used to skip unneeded work early).
-pub fn is_barcode_already_scanned(conn: &Connection, barcode: &str, last_update: &str) -> Result<bool> {
-    let count: i64 = conn
-        .prepare_cached("SELECT COUNT(*) FROM session_barcode WHERE barcode = ?1 AND last_update = ?2")?
-        .query_row(params![barcode, last_update], |row| row.get(0))?;
-    Ok(count > 0)
+pub fn is_barcode_already_scanned(
+    conn: &Connection,
+    barcode: &str,
+    last_update: &str,
+) -> Result<bool> {
+    conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM session_barcode WHERE barcode = ?1 AND last_update = ?2)",
+    )?
+    .query_row(params![barcode, last_update], |row| row.get(0))
+    .map_err(ArchiveError::from)
 }
 
 /// Finds a storage volume ID by name (e.g. "2024-07"), if it exists.
@@ -243,9 +275,11 @@ pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64
              source_subfolder = excluded.source_subfolder,
              content_hash = excluded.content_hash,
              commit_seq = excluded.commit_seq,
-             original_size = excluded.original_size",
+             original_size = excluded.original_size
+         RETURNING id",
     )?
-    .execute(params![
+    .query_row(
+        params![
             entry.scan_session_id,
             entry.barcode,
             entry.relative_path,
@@ -254,10 +288,10 @@ pub fn insert_log_entry(conn: &Connection, entry: &LogEntryInsert) -> Result<i64
             entry.commit_seq as i64,
             entry.original_size as i64,
             entry.file_storage_volume_id,
-        ])?;
-    conn.prepare_cached("SELECT id FROM scanned_log_entry WHERE relative_path = ?1 AND file_storage_volume_id = ?2")?
-        .query_row(params![entry.relative_path, entry.file_storage_volume_id], |r| r.get(0))
-        .map_err(ArchiveError::from)
+        ],
+        |r| r.get(0),
+    )
+    .map_err(ArchiveError::from)
 }
 
 /// Where an indexed file lives (used for extraction and search panels).
@@ -281,29 +315,35 @@ fn location_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntryLocati
     })
 }
 
-/// Retrieves all log entry locations matching an exact barcode.
-pub fn find_entries_by_barcode(conn: &Connection, barcode: &str) -> Result<Vec<LogEntryLocation>> {
-    let mut stmt = conn.prepare(
+/// Runs the location query with the given `WHERE` clause (one `?1` parameter).
+fn find_locations(
+    conn: &Connection,
+    where_clause: &str,
+    param: &str,
+) -> Result<Vec<LogEntryLocation>> {
+    let sql = format!(
         "SELECT sle.relative_path, fsv.path, sle.content_hash, sle.commit_seq
          FROM scanned_log_entry sle
          JOIN file_storage_volume fsv ON fsv.id = sle.file_storage_volume_id
-         WHERE sle.barcode = ?1",
-    )?;
-    let rows = stmt.query_map(params![barcode], location_from_row)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(ArchiveError::from)
+         WHERE {where_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![param], location_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ArchiveError::from)
+}
+
+/// Retrieves all log entry locations matching an exact barcode.
+pub fn find_entries_by_barcode(conn: &Connection, barcode: &str) -> Result<Vec<LogEntryLocation>> {
+    find_locations(conn, "sle.barcode = ?1", barcode)
 }
 
 /// Searches log entries by filename/path substring (used in search panels).
-pub fn find_entries_by_filename_like(conn: &Connection, needle: &str) -> Result<Vec<LogEntryLocation>> {
-    let pattern = format!("%{needle}%");
-    let mut stmt = conn.prepare(
-        "SELECT sle.relative_path, fsv.path, sle.content_hash, sle.commit_seq
-         FROM scanned_log_entry sle
-         JOIN file_storage_volume fsv ON fsv.id = sle.file_storage_volume_id
-         WHERE sle.relative_path LIKE ?1",
-    )?;
-    let rows = stmt.query_map(params![pattern], location_from_row)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(ArchiveError::from)
+pub fn find_entries_by_filename_like(
+    conn: &Connection,
+    needle: &str,
+) -> Result<Vec<LogEntryLocation>> {
+    find_locations(conn, "sle.relative_path LIKE ?1", &format!("%{needle}%"))
 }
 
 /// Saves a committed volume and all its entries inside a single database transaction.
@@ -318,13 +358,10 @@ pub fn record_finished_volume(
 ) -> Result<i64> {
     let tx = conn.transaction()?;
 
-    // Provisional upsert so entry rows have a volume id; the entry count is
-    // corrected below from the actual rows (the inserts are idempotent).
-    let prior_count = match find_volume_by_name(&tx, volume_name)? {
-        Some(id) => existing_entry_count(&tx, id)?,
-        None => 0,
-    };
-    let volume_id = upsert_volume(&tx, volume_name, finished, prior_count, now)?;
+    // Upsert first so entry rows have a volume id. The entry count written
+    // here is a placeholder: nothing reads it inside this transaction and it
+    // is overwritten below from the actual rows before commit.
+    let volume_id = upsert_volume(&tx, volume_name, finished, 0, now)?;
 
     for entry in &finished.written_entries {
         let Some(barcode) = barcode_of(&entry.relative_path) else {
