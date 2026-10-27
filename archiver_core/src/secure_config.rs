@@ -137,10 +137,10 @@ pub fn clear(paths: &SecureConfigPaths) -> Result<()> {
     remove_if_present(&paths.key_file)
 }
 
-/// Removes `path`; a file that is already gone is not an error.
+/// Removes `path` if it exists; a missing file is not an error.
 fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ArchiveError::io(path, e)),
-        _ => Ok(()),
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| ArchiveError::io(path, e))?;
     }
+    Ok(())
 }

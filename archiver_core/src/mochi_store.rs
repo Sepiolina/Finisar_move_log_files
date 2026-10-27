@@ -158,7 +158,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
     let f = fs::File::open(path).map_err(|e| ArchiveError::io(path, e))?;
     let mut hasher = blake3::Hasher::new();
     hasher
-        .update_reader(f)
+        .update_reader(std::io::BufReader::with_capacity(256 * 1024, f))
         .map_err(|e| ArchiveError::io(path, e))?;
     Ok(hasher.finalize().to_hex().to_string())
 }

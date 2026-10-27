@@ -4,7 +4,7 @@
 //! the matching node of its execution-flow diagram.
 
 use archiver_core::db::{self, DbConfig};
-use archiver_core::email_report::{self, ArchiveBreakdownRow, EmailConfig, SessionStats};
+use archiver_core::email_report::{self, EmailConfig, SessionStats};
 use archiver_core::matcher::{has_matching_extension, BarcodeMatcher};
 use archiver_core::repo;
 use archiver_core::schema::open_and_migrate;
@@ -155,18 +155,7 @@ fn session_stats(
         total_files_matched: count(|r| r.barcodes_matched),
         total_files_archived: count(|r| r.files_moved),
         total_files_deleted: count(|r| r.files_deleted),
-        archive_breakdown: ok
-            .map(|r| {
-                r.archive_breakdown
-                    .iter()
-                    .map(|v| ArchiveBreakdownRow {
-                        volume_name: v.volume_name.clone(),
-                        files_archived: v.files_archived,
-                        total_bytes: v.total_bytes,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        archive_breakdown: ok.map(|r| r.archive_breakdown.clone()).unwrap_or_default(),
         unmatched_barcodes: ok.map(|r| r.unmatched_barcodes.clone()).unwrap_or_default(),
         errors: count(|r| r.errors),
         failed: run.as_ref().err().map(|e| e.to_string()),
