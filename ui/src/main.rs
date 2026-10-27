@@ -23,9 +23,7 @@ fn main() {
         }
     }
 
-    let config_dir = directories_next::ProjectDirs::from("com", "log-archiver", "log-archiver")
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config_dir = settings::config_dir().unwrap_or_else(|| PathBuf::from("."));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
