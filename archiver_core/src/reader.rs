@@ -8,13 +8,12 @@
 //! after `read_file` returned `Ok`, so a damaged file is never published.
 
 use crate::error::{ArchiveError, Result};
-use crate::mochi_store::archive_path_of;
+use crate::mochi_store::{archive_path_of, open_read, with_job_ctx};
 use mochi_core::catalog::namespace::{EntryKind, Snapshot};
-use mochi_core::job::{CancellationToken, JobContext, NullProgress};
-use mochi_core::publish::{open_head, OpenedHead, ReadOptions};
+use mochi_core::publish::{OpenedHead, ReadOptions};
 use mochi_core::storage::os::OsReadStorage;
 use mochi_core::MochiError;
-use std::collections::HashMap;
+use std::collections::hash_map::{Entry, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -32,16 +31,16 @@ struct OpenVolume {
 
 impl OpenVolume {
     fn open(volume_path: &Path) -> Result<Self> {
-        let map = |e: MochiError| ArchiveError::from_mochi(volume_path, e);
-        let src = OsReadStorage::open(volume_path).map_err(|e| map(MochiError::from(e)))?;
-        let ro = ReadOptions::default();
-        let head = open_head(&src, &ro).map_err(map)?;
-        let snapshot = head.catalog.replay(None).map_err(map)?;
+        let (src, head) = open_read(volume_path)?;
+        let snapshot = head
+            .catalog
+            .replay(None)
+            .map_err(|e| ArchiveError::from_mochi(volume_path, e))?;
         Ok(OpenVolume {
             src,
             head,
             snapshot,
-            ro,
+            ro: ReadOptions::default(),
             path: volume_path.to_path_buf(),
         })
     }
@@ -54,11 +53,6 @@ impl OpenVolume {
     /// this returns `Ok`). Returns the logical length.
     fn read_file(&self, relative_path: &str, out: &mut dyn Write) -> Result<u64> {
         let path = archive_path_of(relative_path)?;
-        let cancel = CancellationToken::new();
-        let ctx = JobContext {
-            progress: &NullProgress,
-            cancel: &cancel,
-        };
         let entry = self
             .snapshot
             .get(&path)
@@ -69,15 +63,43 @@ impl OpenVolume {
                 format!("{relative_path:?} is a directory"),
             )));
         }
-        mochi_core::read::read_version(&self.src, &self.head.catalog, &entry.version, out, &self.ro, &ctx)
-            .map(|r| r.logical_len)
-            .map_err(|e| self.map(e))
+        with_job_ctx(|ctx| {
+            mochi_core::read::read_version(
+                &self.src,
+                &self.head.catalog,
+                &entry.version,
+                out,
+                &self.ro,
+                ctx,
+            )
+        })
+        .map(|r| r.logical_len)
+        .map_err(|e| self.map(e))
+    }
+
+    /// Every file in the head (directories are skipped): archive-relative
+    /// path and logical length.
+    fn file_paths(&self) -> Result<impl Iterator<Item = (String, u64)>> {
+        let listing = mochi_core::read::list(&self.head, None).map_err(|e| self.map(e))?;
+        Ok(listing
+            .into_iter()
+            .filter(|e| e.kind == EntryKind::File)
+            .map(|e| {
+                (
+                    String::from_utf8_lossy(e.path.as_stored()).into_owned(),
+                    e.logical_len,
+                )
+            }))
     }
 
     /// Logical size of a file entry, if present.
     fn file_size(&self, relative_path: &str) -> Result<Option<u64>> {
         let path = archive_path_of(relative_path)?;
-        let Some(entry) = self.snapshot.get(&path).filter(|e| e.kind == EntryKind::File) else {
+        let Some(entry) = self
+            .snapshot
+            .get(&path)
+            .filter(|e| e.kind == EntryKind::File)
+        else {
             return Ok(None);
         };
         Ok(self
@@ -154,15 +176,11 @@ pub fn list_volume_entries(
     mut on_progress: impl FnMut(usize),
 ) -> Result<Vec<VolumeEntry>> {
     let vol = OpenVolume::open(volume_path)?;
-    let listing = mochi_core::read::list(&vol.head, None).map_err(|e| vol.map(e))?;
     let mut out = Vec::new();
-    for e in listing {
-        if e.kind != EntryKind::File {
-            continue;
-        }
+    for (relative_path, size) in vol.file_paths()? {
         out.push(VolumeEntry {
-            relative_path: String::from_utf8_lossy(e.path.as_stored()).into_owned(),
-            size: e.logical_len,
+            relative_path,
+            size,
         });
         if out.len() % 500 == 0 {
             on_progress(out.len());
@@ -199,13 +217,8 @@ pub fn extract_all_from_volume(
     mut on_progress: impl FnMut(usize),
 ) -> Result<Vec<ExtractedFile>> {
     let vol = OpenVolume::open(volume_path)?;
-    let listing = mochi_core::read::list(&vol.head, None).map_err(|e| vol.map(e))?;
     let mut results = Vec::new();
-    for e in listing {
-        if e.kind != EntryKind::File {
-            continue;
-        }
-        let relative_path = String::from_utf8_lossy(e.path.as_stored()).into_owned();
+    for (relative_path, _) in vol.file_paths()? {
         let dest_path = safe_join(dest_dir, &relative_path)?;
         let bytes_written = write_entry_to(&vol, &relative_path, &dest_path)?;
         results.push(ExtractedFile {
@@ -275,16 +288,6 @@ pub fn extract_entry_to_bytes(volume_path: &Path, relative_path: &str) -> Result
     Ok(buf)
 }
 
-/// Extracts one indexed entry (located through the SQLite index) to `dest_path`.
-/// Replaces the old chunk-offset based extraction: MOCHI needs no offsets.
-pub fn extract_file_from_volume(
-    volume_path: &Path,
-    relative_path: &str,
-    dest_path: &Path,
-) -> Result<u64> {
-    extract_entry_from_volume(volume_path, relative_path, dest_path)
-}
-
 /// Uses the index to find all files for a barcode and extracts them into
 /// `dest_dir/<SUBFOLDER>/<filename>`.
 pub fn extract_by_barcode(
@@ -305,10 +308,10 @@ pub fn extract_locations(
     let mut results = Vec::with_capacity(locations.len());
     for loc in locations {
         let dest_path = safe_join(dest_dir, &loc.relative_path)?;
-        if !volumes.contains_key(loc.volume_path.as_str()) {
-            volumes.insert(&loc.volume_path, OpenVolume::open(Path::new(&loc.volume_path))?);
-        }
-        let vol = &volumes[loc.volume_path.as_str()];
+        let vol = match volumes.entry(loc.volume_path.as_str()) {
+            Entry::Occupied(open) => open.into_mut(),
+            Entry::Vacant(slot) => slot.insert(OpenVolume::open(Path::new(&loc.volume_path))?),
+        };
         let bytes_written = write_entry_to(vol, &loc.relative_path, &dest_path)?;
         results.push(ExtractedFile {
             relative_path: loc.relative_path.clone(),
