@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "e7902607653c65f558f5b4ab16ce65961734139a" }
+mochi-core = { git = "https://github.com/immerh8/MOCHI", rev = "e404917f56b4593bef48b3ad08e62a1e29c33872" }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 thiserror = "1.0"
 rusqlite = { version = "0.40", features = ["bundled"] }
