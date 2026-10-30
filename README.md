@@ -99,30 +99,30 @@ before doing anything else.
 
 | Module | Responsibility |
 |---|---|
-| `mochi_store.rs` | Monthly MOCHI archive writer: create-or-append, byte-bounded commits, hashing, read-only verification |
+| `mochi_store/` | Monthly MOCHI archives: `mod.rs` (shared types, paths, hashing), `write.rs` (create-or-append in bounded commits), `verify.rs` (read-only verification before staging is deleted) |
 | `par.rs` | Small std-only scoped worker pool (ordered results, progress ticks on the calling thread) |
 | `reader.rs` | Reads `.mochi` volumes back out (via `mochi-core`) — extraction, listing, preview, safe path joining |
 | `schema.rs` | SQLite schema (4 tables, `user_version` 2) for the index |
 | `repo.rs` | Typed CRUD over the SQLite index |
 | `matcher.rs` | Boundary-aware Aho-Corasick barcode matching in filenames |
 | `db.rs` | SQL Server (Tiberius) query for archival candidates + resume-window math |
-| `session.rs` | Orchestrates the full scan → stage → archive → verify → cleanup flow |
+| `session/` | One run, one file per step: `mod.rs` (orchestration, resume), `scan.rs`, `stage.rs`, `months.rs` (commit → verify → index → delete, per month), `manifest.rs` (`staging/manifest.jsonl`) |
 | `secure_config.rs` | AES-256-GCM encrypted-at-rest storage for SQL Server connection settings |
 | `email_report.rs` | Builds and POSTs an HTML statistics summary after a run |
 | `error.rs` | Unified `ArchiveError` enum + `Result` alias used everywhere |
 
-Dependency direction: `session.rs` is the only module that pulls all
+Dependency direction: `session/` is the only module that pulls all
 the others together. Everything else is usable independently (e.g.
-`reader.rs` has no dependency on `session.rs`, so a UI's file-browser
+`reader.rs` has no dependency on `session/`, so a UI's file-browser
 tab can extract from a volume without going through a session at
 all).
 
 ---
 
-## 3. The Archive Format — `mochi_store.rs` / `reader.rs`
+## 3. The Archive Format — `mochi_store/` / `reader.rs`
 
 Storage is delegated to **MOCHI** (`mochi-core`, pinned to commit
-`e7902607653c65f558f5b4ab16ce65961734139a`, 0.9.11). A `.mochi` file is
+`e404917f56b4593bef48b3ad08e62a1e29c33872`, 0.9.13). A `.mochi` file is
 an append-only chain of **commits**; every commit is a full snapshot of
 a namespace of files and directories, hash-anchored with BLAKE3. The
 program keeps the same *what/how* as before — only the container
@@ -165,13 +165,11 @@ changed:
    was already committed, see *Idempotency*).
    **Content:** every file is streamed into the writer with
    `Transaction::put_file_from`, one chunk at a time, so no file is held in
-   memory whole. MOCHI 0.9.11 reads, hashes and compresses the content on
-   worker threads ahead of the writer (`WriterOptions::threads`, set to the
-   archiver's per-month worker count so two months written at once do not
-   oversubscribe the CPU); the archive is the same bytes for any thread
-   count. 0.9.11 also streams small files as cheaply as in-memory ones
-   (0.9.10 zero-filled an 8 MiB buffer per file, which is why the archiver
-   used to read small files into memory itself).
+   memory whole. MOCHI (0.9.11+) reads, hashes and compresses the content
+   on worker threads ahead of the writer (`WriterOptions::threads`, set to
+   the archiver's per-month share of the workers so months written at once
+   do not oversubscribe the CPU); the archive is the same bytes for any
+   thread count, and small files stream as cheaply as in-memory ones.
    **Peak memory:** MOCHI's in-flight chunks, about `2 × threads` pieces of
    at most 8 MiB plus their frames per month being written.
    **Linear cost:** the head namespace is replayed once per call, not once
@@ -210,18 +208,26 @@ never shown as success-styled "safe".
 ### Verification (replaces "decompress a chunk and count")
 
 After the commit, `mochi_store::verify_volume_with` reopens the archive
-**read-only** (`OsReadStorage` + `open_head`, one independent handle per
-worker thread) and, for every staged entry, requires:
+**read-only** and runs two checks **at the same time**, each on its own
+read-only handle (`OsReadStorage` + `open_head`).
+
+The per-file check requires, for every staged entry:
 
 1. the path is present in the head as a file;
 2. the head's BLAKE3 content hash equals the BLAKE3 of the staged file
-   on disk (hashed again at this point, streaming);
+   on disk (hashed again at this point, streaming, on worker threads
+   while the head is being opened);
 3. a full verified read of the stored copy (`read::read_version`, from a
-   namespace replayed once per worker: `read::read_file` replays the
-   whole namespace on every call, which is quadratic for 100k+ files)
-   succeeds and its bytes hash to the same value;
+   namespace replayed once: `read::read_file` replays the whole namespace
+   on every call, which is quadratic for 100k+ files) succeeds and its
+   bytes hash to the same value.
 
-then the archive structure:
+It opens **one** head. Opening the head of a 100,000-file archive costs
+about 3.5 s, and four opened at once took 10.4 s *each* on the 4-core test
+VM, so the per-worker heads the archiver used before cost more than the
+parallel reads saved.
+
+The structural check, which must have seen the same head:
 
 - **Append to a known head** (the head the index recorded after the
   previous verified write equals the archive's head before this run's
@@ -338,7 +344,7 @@ Key constraints:
   dedup mechanism across runs. `repo::record_session_barcode` treats
   a constraint violation as `Ok(None)`, not an error.
 - `scanned_log_entry` is `UNIQUE(relative_path, file_storage_volume_id)`
-  — a given path is recorded once per volume. `session.rs` dedups matched
+  — a given path is recorded once per volume. `session/scan.rs` dedups matched
   files by `relative_path` **before** staging (see §5), and
   `repo::insert_log_entry` is an upsert on that key, so a resumed batch
   (committed or even recorded before the crash) updates the existing row
@@ -365,7 +371,7 @@ or empty database is created fresh.
 
 ---
 
-## 5. Session Orchestration — `session.rs`
+## 5. Session Orchestration — `session/`
 
 This is the largest module and the one that wires everything else
 together. Its steps, in order:
@@ -419,9 +425,11 @@ together. Its steps, in order:
 8. **Archive + verify + cleanup** — delegated to `finish_staged_batch`
    (shared with the resume path in step 1):
    - Group staged entries by target volume (`YYYY-MM`).
-   - Months are separate archives with separate writer locks, so up to
-     `workers / 2` of them are committed and verified at once on worker
-     threads. Workers never touch SQLite or delete anything.
+   - Months are separate archives with separate writer locks, so all of
+     them (up to `workers`) are committed and verified at once on worker
+     threads, sharing the CPU threads between them: much of a MOCHI commit
+     runs on a single thread, so months side by side keep the cores busy.
+     Workers never touch SQLite or delete anything.
    - For each volume: `mochi_store::store_volume_with` creates or appends
      `<output_dir>/<YYYY>/<YYYY-MM>.mochi` in bounded commits and closes
      the writer.
@@ -632,7 +640,7 @@ used as the return type throughout the crate.
 
 | Crate | Purpose |
 |---|---|
-| `mochi-core` (git, pinned rev `e790260`, 0.9.11) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
+| `mochi-core` (git, pinned rev `e404917`, 0.9.13) | MOCHI archives: create/append commits, read, verify (needs Rust >= 1.89) |
 | `blake3` | BLAKE3 of staged files (same hash MOCHI records as the content hash) |
 | `rusqlite` 0.40 (bundled) | SQLite index (must match `mochi-core`'s version: both link `sqlite3`) |
 | `aho-corasick` | multi-pattern barcode matching in filenames |
@@ -656,7 +664,8 @@ used as the return type throughout the crate.
 | `tests/mochi_file_viewer.rs` | Whole-volume listing/extraction/overwrite, bounded preview | 5 |
 | `tests/secure_config.rs` | Round-trip, tamper detection, wrong-key rejection | 8 |
 | `src/email_report.rs` (inline) | Size-budget shrinking, escaping | 3 |
-| `src/session.rs` (inline) | Manifest round trip, truncated-line tolerance, orphaned-session-id recovery | 3 |
+| `src/session/manifest.rs` (inline) | Manifest round trip, truncated-line tolerance | 2 |
+| `src/session/mod.rs` (inline) | Orphaned-session-id recovery | 1 |
 | `tests/large_batch_integrity.rs` | Staging never overwrites, a failing month keeps its files and does not block the others (then resumes), append verified against the previous head (wrong anchor and changed file fail), file-count commit bound + streamed big file | 4 |
 | `src/par.rs` (inline) | Worker pool order and progress | 1 |
 | `src/matcher.rs` (inline) | Whole-char boundary checks, extension edge cases | 2 |
@@ -695,6 +704,27 @@ local SSD:
 | 300,000 files, 3 months | (quadratic, not run) | **158 s** (1,900 files/s) |
 | append 2,000 files to a 100,000-file month | — | **11 s** |
 
+**mochi-core 0.9.13 and the split verify (this version).** The same
+benchmark, the previous code (mochi-core 0.9.11) and this one run back to
+back on the same 4-core VM, two rounds each (this VM's disk is noisy, so
+compare within a row):
+
+| Run | Previous code | This version |
+|---|---|---|
+| 20,000 files, 1 month | 11.8 s / 12.7 s | **10.2 s / 10.1 s** |
+| then append 2,000 | 3.0 s / 3.0 s | **2.6 s / 2.6 s** |
+| 60,000 files, 3 months | 31.0 s / 28.0 s | **23.3 s / 25.4 s** |
+| then append 4,000 | 6.4 s / 6.4 s | **4.7 s / 4.2 s** |
+| 100,000 files, 1 month | 85.8 s / 81.0 s | **71.2 s / 71.0 s** |
+| then append 4,000 | 18.0 s / 18.1 s | **14.1 s / 14.8 s** |
+
+Where it came from (measured on the 100,000-file month): verification
+went from about 30 s to about 21 s, because the per-file check opens one
+head instead of one per worker and runs alongside MOCHI's structural check
+instead of before it. Three months now run side by side instead of two
+followed by one. Committing (about 40 s of that run) is MOCHI's own work
+and is unchanged.
+
 Where the time went before: every verification read used
 `read::read_file`, which replays the whole namespace per call, and every
 commit replayed the head again, so a month of N files cost O(N²).
@@ -706,17 +736,19 @@ What changed:
 | Scan | subfolders listed in parallel; entry type from the listing (no `stat` per file); only matches are `stat`ed |
 | Candidate check | one read transaction and cached statements for 300k lookups |
 | Stage | manifest synced per 2,000 lines, renames in parallel, directories created once |
-| Commit | bounded by files and bytes; every file streamed, MOCHI compresses on worker threads (0.9.11); one namespace replay per month; hashes taken from MOCHI's catalog |
-| Verify | per-file checks on worker threads with `read_version`; structural check only of the new commits when the previous head is known |
-| Months | written and verified concurrently (separate archives, separate locks) |
+| Commit | bounded by files and bytes; every file streamed, MOCHI compresses on worker threads; one namespace replay per month; hashes taken from MOCHI's catalog |
+| Verify | per-file checks against **one** opened head with `read_version`, staged files hashed on worker threads meanwhile; MOCHI's structural check at the same time, only of the new commits when the previous head is known |
+| Months | all written and verified concurrently, up to one per worker (separate archives, separate locks) |
 | Index | cached statements for the per-row inserts |
-| Cleanup | per month, right after it is indexed, in parallel |
+| Cleanup | per month, right after it is indexed, on twice as many threads as cores (deletes wait on the disk) |
 
 `SessionConfig::workers` sets the thread count (`0`: the CPU count, at
-most 8). On a network share more threads mainly help the rename and
-delete steps; on a slow single disk, fewer may be better.
+most 8). Renames into staging and deletes of staged copies use twice that,
+at most 16: they wait on the disk far more than they use a core (deleting
+50,000 synced files took 6.3 s on 1 thread, 3.5 s on 4 and 2.9 s on 16).
+On a slow single disk, fewer may be better.
 
 Remaining fixed costs come from MOCHI itself: opening the head of a
-100,000-file archive takes about 2.5 s (once for the writer, once per
-verification worker, once for the scoped check), and a commit costs about
-0.25 ms per small file.
+100,000-file archive takes about 3.5 s (once for the writer, once for the
+per-file check, once for the structural check), and a commit costs about
+0.3–0.4 ms per small file.
