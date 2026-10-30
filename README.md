@@ -1,5 +1,7 @@
 # Log Archiver — `archiver_core` Documentation
 
+For complete file-by-file and function-by-function contracts, see the [source reference](docs/reference/README.md).
+
 This document describes the design, data flow, and module-by-module
 behavior of the `archiver_core` Rust crate: a tool that finds log
 files matching barcodes queried from SQL Server, commits them into
